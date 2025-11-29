@@ -271,4 +271,4 @@ def augment_dataset(input_dir, output_dir, input_yaml="dataset.yaml"):
 
 # ---------- Entry point ----------
 if __name__ == "__main__":
-    augment_dataset("dataset/N_Project_v1-product-detection-1_yolov11", "Ogg_Dataset")
+    augment_dataset("./dataset/YOLO/yolov11", "Oggy_Dataset")

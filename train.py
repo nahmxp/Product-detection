@@ -1,14 +1,14 @@
 from ultralytics import YOLO
 
 # Load a pretrained YOLO11 segment model
-model = YOLO("./Model/yolo11s-seg.pt")
+model = YOLO("./Model/yolo11m-seg.pt")
 
 # Train the model
 results = model.train(
-    data="./dataset/Oggy_Dataset/data.yaml",   # dataset config
+    data="./dataset/YOLO/yolov11/data.yaml",   # dataset config
     imgsz=640,                        # image size
-    batch=32,                         # you can increase since you have 16GB VRAM
-    epochs=1000,                       # start with 100; avoid 350 for small dataset
+    batch=24,                         # you can increase since you have 16GB VRAM
+    epochs=10,                       # start with 100; avoid 350 for small dataset
     patience=10,                      # early stopping: stop if no improvement in 20 epochs
     workers=0,                        # safe for 4060 Ti
     device=0,                         # use GPU
