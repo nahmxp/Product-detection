@@ -8,6 +8,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from ultralytics import YOLO
 from PIL import Image
+import json
+import random
+import shutil
+import zipfile
+import tempfile
+from tqdm import tqdm
+from collections import defaultdict
+import numpy as np
 
 # Page configuration
 st.set_page_config(
@@ -244,15 +252,336 @@ def convert_to_tflite_simple(model_path):
         st.error(f"Conversion error: {str(e)}")
         return False, None
 
+def coco_to_yolo_streamlit(coco_json, output_dir, train_ratio=0.7, val_ratio=0.2, test_ratio=0.1, progress_callback=None):
+    """
+    Convert COCO dataset to YOLO format with folder structure:
+    output_dir/
+      ├── classes.txt
+      ├── data.yaml
+      ├── train/
+      │   ├── images/
+      │   └── labels/
+      ├── valid/
+      │   ├── images/
+      │   └── labels/
+      └── test/
+          ├── images/
+          └── labels/
+    """
+    try:
+        with open(coco_json, 'r') as f:
+            coco = json.load(f)
+
+        images = {img["id"]: img for img in coco["images"]}
+        annotations = coco["annotations"]
+        categories = {cat["id"]: cat["name"] for cat in coco["categories"]}
+        category_mapping = {cat_id: idx for idx, cat_id in enumerate(categories.keys())}
+
+        # Create YOLO dirs with the new structure
+        for split in ["train", "valid", "test"]:
+            os.makedirs(os.path.join(output_dir, split, "images"), exist_ok=True)
+            os.makedirs(os.path.join(output_dir, split, "labels"), exist_ok=True)
+
+        # Split dataset
+        image_ids = list(images.keys())
+        random.shuffle(image_ids)
+        n_train = int(len(image_ids) * train_ratio)
+        n_val = int(len(image_ids) * val_ratio)
+        train_ids = set(image_ids[:n_train])
+        val_ids = set(image_ids[n_train:n_train+n_val])
+        test_ids = set(image_ids[n_train+n_val:])
+
+        img_to_anns = defaultdict(list)
+        for ann in annotations:
+            img_to_anns[ann["image_id"]].append(ann)
+
+        total_images = len(img_to_anns)
+        processed = 0
+
+        for img_id, anns in img_to_anns.items():
+            img_info = images[img_id]
+            file_name = img_info["file_name"]
+
+            # Get width/height from JSON or from image
+            if "width" in img_info and "height" in img_info:
+                width, height = img_info["width"], img_info["height"]
+            else:
+                img_path = Path(coco_json).parent / file_name
+                with Image.open(img_path) as im:
+                    width, height = im.size
+
+            # Decide split (use "valid" instead of "val")
+            if img_id in train_ids:
+                split = "train"
+            elif img_id in val_ids:
+                split = "valid"
+            else:
+                split = "test"
+
+            # Copy image to new structure: split/images/
+            src_path = Path(coco_json).parent / file_name
+            dst_path = Path(output_dir) / split / "images" / Path(file_name).name
+            os.makedirs(dst_path.parent, exist_ok=True)
+            if os.path.exists(src_path):
+                shutil.copy(src_path, dst_path)
+
+            # Write YOLO label to new structure: split/labels/
+            label_path = Path(output_dir) / split / "labels" / (Path(file_name).stem + ".txt")
+            with open(label_path, "w") as f:
+                for ann in anns:
+                    cat_id = ann["category_id"]
+                    class_id = category_mapping[cat_id]
+
+                    # Handle polygons if available (for segmentation)
+                    if "segmentation" in ann and isinstance(ann["segmentation"], list) and len(ann["segmentation"]) > 0:
+                        poly = np.array(ann["segmentation"][0]).reshape(-1, 2)
+                        poly[:, 0] /= width
+                        poly[:, 1] /= height
+                        poly_str = " ".join([f"{x:.6f} {y:.6f}" for x, y in poly])
+                        f.write(f"{class_id} {poly_str}\n")
+                    else:
+                        # Fallback to bbox
+                        x, y, w, h = ann["bbox"]
+                        cx, cy = (x + w / 2) / width, (y + h / 2) / height
+                        nw, nh = w / width, h / height
+                        f.write(f"{class_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}\n")
+
+            processed += 1
+            if progress_callback:
+                progress_callback(processed / total_images)
+
+        # Create classes.txt
+        class_names = [categories[k] for k in sorted(categories.keys())]
+        classes_path = Path(output_dir) / "classes.txt"
+        with open(classes_path, "w") as cf:
+            for class_name in class_names:
+                cf.write(f"{class_name}\n")
+
+        # Create data.yaml
+        yaml_dict = {
+            "path": str(Path(output_dir).absolute()),
+            "train": "train/images",
+            "val": "valid/images",
+            "test": "test/images",
+            "nc": len(class_names),
+            "names": class_names
+        }
+        with open(Path(output_dir) / "data.yaml", "w") as yf:
+            yaml.dump(yaml_dict, yf, default_flow_style=False)
+
+        return True, len(train_ids), len(val_ids), len(test_ids), class_names
+        
+    except Exception as e:
+        return False, str(e), 0, 0, []
+
+def unzip_and_convert_streamlit(zip_path, output_dir, train_ratio=0.7, val_ratio=0.2, test_ratio=0.1, progress_callback=None):
+    """Unzip COCO dataset and convert to YOLO format"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Extract ZIP
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(tmpdir)
+
+        # Find coco.json inside extracted folder
+        coco_json = None
+        for root, _, files in os.walk(tmpdir):
+            if "coco.json" in files:
+                coco_json = os.path.join(root, "coco.json")
+                break
+            # Also check for _annotations.coco.json (common in Roboflow exports)
+            for file in files:
+                if file.endswith(".json") and "coco" in file.lower():
+                    coco_json = os.path.join(root, file)
+                    break
+            if coco_json:
+                break
+
+        if coco_json is None:
+            return False, "coco.json not found inside ZIP!", 0, 0, []
+
+        return coco_to_yolo_streamlit(coco_json, output_dir, train_ratio, val_ratio, test_ratio, progress_callback)
+
 # Main App Layout
 st.title("🚀 YOLO Training & Conversion Dashboard")
 st.markdown("---")
 
 # Create tabs for different sections
-tab1, tab2 = st.tabs(["🔄 TFLite Conversion", "🎯 Model Training"])
+tab1, tab2, tab3 = st.tabs(["📦 COCO to YOLO Converter", "🔄 TFLite Conversion", "🎯 Model Training"])
 
-# ==================== TAB 1: TFLite Conversion ====================
+# ==================== TAB 1: COCO to YOLO Converter ====================
 with tab1:
+    st.header("📦 Convert COCO Dataset to YOLO Format")
+    st.markdown("Upload or select a COCO format dataset (.zip) and convert it to YOLO format with the correct folder structure")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("Dataset Selection")
+        
+        # Option to upload ZIP or select existing
+        conversion_option = st.radio(
+            "Choose dataset source:",
+            ["Upload ZIP file", "Select from dataset folder"],
+            key="conversion_option"
+        )
+        
+        zip_file_path = None
+        
+        if conversion_option == "Upload ZIP file":
+            uploaded_file = st.file_uploader(
+                "Upload COCO dataset ZIP file",
+                type=['zip'],
+                help="Upload a ZIP file containing COCO format dataset with coco.json"
+            )
+            
+            if uploaded_file is not None:
+                # Save uploaded file temporarily
+                temp_zip_path = os.path.join(tempfile.gettempdir(), uploaded_file.name)
+                with open(temp_zip_path, 'wb') as f:
+                    f.write(uploaded_file.read())
+                zip_file_path = temp_zip_path
+                st.success(f"✅ Uploaded: {uploaded_file.name}")
+        else:
+            # Find ZIP files in dataset folder
+            zip_files = glob.glob(os.path.join(DATASET_DIR, "**/*.zip"), recursive=True)
+            
+            if zip_files:
+                zip_options = [os.path.relpath(z, DATASET_DIR) for z in zip_files]
+                selected_zip = st.selectbox(
+                    "Select ZIP file:",
+                    zip_options,
+                    key="existing_zip"
+                )
+                zip_file_path = os.path.join(DATASET_DIR, selected_zip)
+                st.info(f"📁 Selected: {selected_zip}")
+            else:
+                st.warning("⚠️ No ZIP files found in dataset folder")
+        
+        # Output directory
+        st.subheader("Output Configuration")
+        output_name = st.text_input(
+            "Output folder name:",
+            value="converted_yolo_dataset",
+            help="Name for the output YOLO dataset folder"
+        )
+        
+        output_path = os.path.join(DATASET_DIR, "YOLO", output_name)
+        st.text(f"Output path: {output_path}")
+    
+    with col2:
+        st.subheader("Split Ratios")
+        train_ratio = st.slider("Train ratio", 0.5, 0.9, 0.7, 0.05, key="train_ratio")
+        val_ratio = st.slider("Validation ratio", 0.1, 0.3, 0.2, 0.05, key="val_ratio")
+        test_ratio = st.slider("Test ratio", 0.05, 0.3, 0.1, 0.05, key="test_ratio")
+        
+        # Check if ratios sum to 1
+        total_ratio = train_ratio + val_ratio + test_ratio
+        if abs(total_ratio - 1.0) > 0.01:
+            st.error(f"⚠️ Ratios must sum to 1.0 (current: {total_ratio:.2f})")
+        else:
+            st.success(f"✅ Ratios valid (sum: {total_ratio:.2f})")
+        
+        st.markdown("---")
+        st.markdown("### Output Structure")
+        st.code("""
+output_folder/
+├── classes.txt
+├── data.yaml
+├── train/
+│   ├── images/
+│   └── labels/
+├── valid/
+│   ├── images/
+│   └── labels/
+└── test/
+    ├── images/
+    └── labels/
+        """, language="text")
+    
+    st.markdown("---")
+    
+    # Convert button
+    if zip_file_path and abs(total_ratio - 1.0) <= 0.01:
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+        
+        with col_btn2:
+            if st.button("🚀 Convert to YOLO Format", type="primary", use_container_width=True, key="convert_coco_btn"):
+                if os.path.exists(output_path):
+                    st.warning(f"⚠️ Output folder already exists: {output_path}")
+                    if st.button("⚠️ Overwrite existing folder?", key="overwrite_btn"):
+                        shutil.rmtree(output_path)
+                    else:
+                        st.stop()
+                
+                with st.spinner("🔄 Converting COCO to YOLO format..."):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    def update_progress(val):
+                        progress_bar.progress(val)
+                        status_text.text(f"Processing images... {int(val * 100)}%")
+                    
+                    status_text.text("📂 Extracting ZIP file...")
+                    
+                    success, *result = unzip_and_convert_streamlit(
+                        zip_path=zip_file_path,
+                        output_dir=output_path,
+                        train_ratio=train_ratio,
+                        val_ratio=val_ratio,
+                        test_ratio=test_ratio,
+                        progress_callback=update_progress
+                    )
+                    
+                    progress_bar.progress(100)
+                    status_text.empty()
+                    
+                    if success:
+                        n_train, n_val, n_test, class_names = result
+                        st.success("✅ Conversion completed successfully!")
+                        
+                        # Show statistics
+                        st.subheader("📊 Conversion Statistics")
+                        
+                        stat_cols = st.columns(4)
+                        with stat_cols[0]:
+                            st.metric("Training Images", n_train)
+                        with stat_cols[1]:
+                            st.metric("Validation Images", n_val)
+                        with stat_cols[2]:
+                            st.metric("Test Images", n_test)
+                        with stat_cols[3]:
+                            st.metric("Total Classes", len(class_names))
+                        
+                        # Show classes
+                        st.subheader("🏷️ Classes")
+                        st.write(", ".join(class_names))
+                        
+                        # Show file paths
+                        st.subheader("📁 Generated Files")
+                        st.code(f"""
+✅ {output_path}/data.yaml
+✅ {output_path}/classes.txt
+✅ {output_path}/train/images/ ({n_train} images)
+✅ {output_path}/train/labels/ ({n_train} labels)
+✅ {output_path}/valid/images/ ({n_val} images)
+✅ {output_path}/valid/labels/ ({n_val} labels)
+✅ {output_path}/test/images/ ({n_test} images)
+✅ {output_path}/test/labels/ ({n_test} labels)
+                        """, language="text")
+                        
+                        st.info(f"💡 **data.yaml path**: `{os.path.join(output_path, 'data.yaml')}`")
+                        st.markdown("You can now use this dataset for training in the **Model Training** tab!")
+                    else:
+                        error_msg = result[0]
+                        st.error(f"❌ Conversion failed: {error_msg}")
+    elif not zip_file_path:
+        st.info("📤 Please upload or select a ZIP file to start conversion")
+    else:
+        st.error("⚠️ Please adjust the split ratios to sum to 1.0")
+
+st.markdown("---")
+
+# ==================== TAB 2: TFLite Conversion ====================
+with tab2:
     st.header("📦 Convert Model to TFLite")
     st.markdown("Select any trained `.pt` model and convert it to TFLite format")
     
@@ -324,8 +653,8 @@ with tab1:
 
 st.markdown("---")
 
-# ==================== TAB 2: Model Training ====================
-with tab2:
+# ==================== TAB 3: Model Training ====================
+with tab3:
 
     st.header("🎯 Train YOLO Model")
     st.markdown("Configure training parameters and train your model")
