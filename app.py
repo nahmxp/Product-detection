@@ -16,6 +16,9 @@ import tempfile
 from tqdm import tqdm
 from collections import defaultdict
 import numpy as np
+import cv2
+import albumentations as A
+import math
 
 # Page configuration
 st.set_page_config(
@@ -400,12 +403,431 @@ def unzip_and_convert_streamlit(zip_path, output_dir, train_ratio=0.7, val_ratio
 
         return coco_to_yolo_streamlit(coco_json, output_dir, train_ratio, val_ratio, test_ratio, progress_callback)
 
+# ==================== Augmentation Helper Functions ====================
+def parse_yolo_label(line):
+    """Parse YOLO label line into dict with class, bbox, or poly"""
+    parts = line.strip().split()
+    cls = int(parts[0])
+    coords = list(map(float, parts[1:]))
+    if len(coords) == 4:
+        return {"class": cls, "bbox": coords, "poly": None}
+    else:
+        poly = [(coords[i], coords[i + 1]) for i in range(0, len(coords), 2)]
+        return {"class": cls, "bbox": None, "poly": poly}
+
+def save_yolo_label(path: Path, labels):
+    """Save YOLO labels to file"""
+    with open(path, "w") as f:
+        for lab in labels:
+            cls = lab["class"]
+            if lab["bbox"] is not None:
+                cx, cy, w, h = lab["bbox"]
+                f.write(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+            elif lab["poly"] is not None:
+                poly_str = " ".join([f"{x:.6f} {y:.6f}" for x, y in lab["poly"]])
+                f.write(f"{cls} {poly_str}\n")
+
+def poly_to_keypoints(poly_abs):
+    """Convert polygon to keypoints"""
+    return [(x, y) for x, y in poly_abs]
+
+def reconstruct_polygons_from_keypoints(keypoints, poly_splits):
+    """Reconstruct polygons from keypoints after augmentation"""
+    polys = []
+    for cls, start, length in poly_splits:
+        pts = keypoints[start:start+length]
+        polys.append((cls, pts))
+    return polys
+
+def polygon_to_bbox_norm(poly_pts, img_w, img_h):
+    """Convert polygon to normalized bounding box"""
+    xs = [p[0] for p in poly_pts]
+    ys = [p[1] for p in poly_pts]
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+    cx = ((x1 + x2) / 2) / img_w
+    cy = ((y1 + y2) / 2) / img_h
+    bw = (x2 - x1) / img_w
+    bh = (y2 - y1) / img_h
+    return [cx, cy, bw, bh]
+
+def low_res(img, **kwargs):
+    """Low resolution simulation augmentation"""
+    scale_factor = np.random.uniform(0.3, 0.5)  # 30%-50% of original
+    h, w = img.shape[:2]
+    new_h, new_w = max(1, int(h * scale_factor)), max(1, int(w * scale_factor))
+    img_small = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    img_up = cv2.resize(img_small, (w, h), interpolation=cv2.INTER_LINEAR)
+    return img_up
+
+def augment_dataset_streamlit(input_dir, output_dir, progress_callback=None, status_callback=None):
+    """
+    Augment YOLO dataset with geometric and photometric transforms.
+    Preserves exact calculations from aug.py.
+    
+    Args:
+        input_dir: Path to input YOLO dataset
+        output_dir: Path to output augmented dataset
+        progress_callback: Function to update progress (0.0 to 1.0)
+        status_callback: Function to update status text
+    
+    Returns:
+        success: bool
+        stats: dict with augmentation statistics
+    """
+    try:
+        input_dir = Path(input_dir)
+        output_dir = Path(output_dir)
+
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+
+        # Create output directories
+        for split in ["train", "valid", "test"]:
+            (output_dir / split / "images").mkdir(parents=True, exist_ok=True)
+            (output_dir / split / "labels").mkdir(parents=True, exist_ok=True)
+
+        # --- Define augmentations (exactly as in aug.py) ---
+        geo_augs = [
+            ("hflip", A.HorizontalFlip(p=1.0)),
+            ("vflip", A.VerticalFlip(p=1.0)),
+            ("rot90", A.Rotate(limit=(90, 90), p=1.0)),
+            ("rot180", A.Rotate(limit=(180, 180), p=1.0)),
+            ("rot270", A.Rotate(limit=(270, 270), p=1.0)),
+            ("shear_x15", A.Affine(shear={"x": 15, "y": 0}, p=1.0)),
+            ("shear_x-15", A.Affine(shear={"x": -15, "y": 0}, p=1.0)),
+            ("shear_y15", A.Affine(shear={"x": 0, "y": 15}, p=1.0)),
+            ("shear_y-15", A.Affine(shear={"x": 0, "y": -15}, p=1.0)),
+        ]
+
+        # Fine rotation augmentations (every 12 degrees)
+        fine_rotations = [
+            (f"rot{i}", A.Rotate(limit=(i, i), p=1.0))
+            for i in range(12, 360, 12)
+        ]
+
+        # Zoom-out augmentations (scale down to smaller)
+        zoom_outs = [
+            (f"zoom_{scale}", A.Affine(scale=scale / 100.0, p=1.0))
+            for scale in range(90, 30, -10)
+        ]
+
+        geo_augs = geo_augs + fine_rotations + zoom_outs
+
+        # Photometric transforms (image-only)
+        photo_augs = [
+            ("brightness_contrast", A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.7)),
+            ("hsv_shift", A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=20, val_shift_limit=15, p=0.7)),
+            ("rgb_shift", A.RGBShift(r_shift_limit=15, g_shift_limit=15, b_shift_limit=15, p=0.5)),
+            ("clahe", A.CLAHE(clip_limit=2.0, tile_grid_size=(8,8), p=0.3)),
+            ("gamma", A.RandomGamma(gamma_limit=(80, 120), p=0.5)),
+            ("motion_blur", A.MotionBlur(blur_limit=3, p=0.3)),
+            ("gauss_noise", A.GaussNoise(p=0.3)),
+            ("low_light", A.RandomBrightnessContrast(brightness_limit=(-0.6, -0.4), contrast_limit=(-0.4, -0.2), p=1.0)),
+            ("overexposed", A.RandomBrightnessContrast(brightness_limit=(0.4, 0.6), contrast_limit=(0.2, 0.4), p=1.0)),
+            ("reflection_reduce", A.Sequential([
+                A.MedianBlur(blur_limit=5, p=1.0),
+                A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=1.0)
+            ], p=1.0)),
+            ("low_res", A.Lambda(image=low_res, p=1.0)),
+        ]
+
+        stats = {
+            "original_images": 0,
+            "augmented_images": 0,
+            "total_augmentations": len(geo_augs) + len(photo_augs),
+            "splits": {}
+        }
+
+        # Calculate total work for progress
+        total_work = 0
+        for split in ["train", "valid", "test"]:
+            img_dir = input_dir / split / "images"
+            if img_dir.exists():
+                img_files = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpeg"))
+                total_work += len(img_files)
+        
+        completed_work = 0
+
+        # --- Process dataset ---
+        for split in ["train", "valid", "test"]:
+            img_dir = input_dir / split / "images"
+            lbl_dir = input_dir / split / "labels"
+            out_img_dir = output_dir / split / "images"
+            out_lbl_dir = output_dir / split / "labels"
+
+            if not img_dir.exists():
+                continue
+
+            img_files = sorted(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")) + list(img_dir.glob("*.jpeg")))
+            
+            split_stats = {
+                "original": len(img_files),
+                "augmented": 0
+            }
+
+            for img_file in img_files:
+                if status_callback:
+                    status_callback(f"Processing {split}: {img_file.name}")
+                
+                label_file = lbl_dir / (img_file.stem + ".txt")
+                image = cv2.imread(str(img_file))
+                if image is None:
+                    continue
+                orig_h, orig_w = image.shape[:2]
+
+                labels = []
+                if label_file.exists():
+                    with open(label_file, "r") as f:
+                        for line in f:
+                            if line.strip():
+                                labels.append(parse_yolo_label(line))
+
+                # Copy original
+                shutil.copy(str(img_file), str(out_img_dir / img_file.name))
+                if label_file.exists():
+                    shutil.copy(str(label_file), str(out_lbl_dir / label_file.name))
+
+                keypoints, keypoints_cls, poly_splits, bboxes_pascal, bboxes_cls = [], [], [], [], []
+
+                for lab in labels:
+                    if lab["bbox"] is not None:
+                        cx, cy, bw, bh = lab["bbox"]
+                        x1 = (cx - bw/2) * orig_w
+                        y1 = (cy - bh/2) * orig_h
+                        x2 = (cx + bw/2) * orig_w
+                        y2 = (cy + bh/2) * orig_h
+                        bboxes_pascal.append([x1, y1, x2, y2])
+                        bboxes_cls.append(lab["class"])
+                    elif lab["poly"] is not None:
+                        abs_poly = [(px * orig_w, py * orig_h) for px, py in lab["poly"]]
+                        start = len(keypoints)
+                        for pt in abs_poly:
+                            keypoints.append(pt)
+                            keypoints_cls.append(lab["class"])
+                        poly_splits.append((lab["class"], start, len(abs_poly)))
+
+                # 1) Geometric augmentations
+                if len(bboxes_pascal) > 0 or len(keypoints) > 0:
+                    for name, aug in geo_augs:
+                        transform = A.Compose(
+                            [aug],
+                            bbox_params=A.BboxParams(format="pascal_voc", label_fields=["bboxes_cls"]),
+                            keypoint_params=A.KeypointParams(format="xy", remove_invisible=False, label_fields=["keypoints_cls"]),
+                        )
+
+                        transformed = transform(
+                            image=image,
+                            bboxes=bboxes_pascal,
+                            bboxes_cls=bboxes_cls,
+                            keypoints=keypoints,
+                            keypoints_cls=keypoints_cls,
+                        )
+
+                        aug_img = transformed["image"]
+                        new_h, new_w = aug_img.shape[:2]
+
+                        new_labels = []
+                        for bbox, cls in zip(transformed["bboxes"], transformed["bboxes_cls"]):
+                            x1, y1, x2, y2 = bbox
+                            cx = ((x1 + x2) / 2) / new_w
+                            cy = ((y1 + y2) / 2) / new_h
+                            bw = (x2 - x1) / new_w
+                            bh = (y2 - y1) / new_h
+                            new_labels.append({"class": cls, "bbox": [cx, cy, bw, bh], "poly": None})
+
+                        if poly_splits:
+                            polys = reconstruct_polygons_from_keypoints(transformed["keypoints"], poly_splits)
+                            for cls, pts in polys:
+                                norm = [(max(min(x / new_w, 1.0), 0.0), max(min(y / new_h, 1.0), 0.0)) for x, y in pts]
+                                if len(norm) >= 3:
+                                    new_labels.append({"class": cls, "bbox": None, "poly": norm})
+                                else:
+                                    bbox_norm = polygon_to_bbox_norm([(x*new_w, y*new_h) for x,y in norm], new_w, new_h)
+                                    new_labels.append({"class": cls, "bbox": bbox_norm, "poly": None})
+
+                        cv2.imwrite(str(out_img_dir / f"{img_file.stem}_{name}.jpg"), aug_img)
+                        save_yolo_label(out_lbl_dir / f"{img_file.stem}_{name}.txt", new_labels)
+                        split_stats["augmented"] += 1
+
+                # 2) Photometric augmentations
+                for name, aug in photo_augs:
+                    transform = A.Compose([aug])
+                    transformed = transform(image=image)
+                    aug_img = transformed["image"]
+                    new_h, new_w = aug_img.shape[:2]
+
+                    cv2.imwrite(str(out_img_dir / f"{img_file.stem}_{name}.jpg"), aug_img)
+
+                    new_labels = []
+                    for bbox, cls in zip(bboxes_pascal, bboxes_cls):
+                        x1, y1, x2, y2 = bbox
+                        cx = ((x1 + x2) / 2) / new_w
+                        cy = ((y1 + y2) / 2) / new_h
+                        bw = (x2 - x1) / new_w
+                        bh = (y2 - y1) / new_h
+                        new_labels.append({"class": cls, "bbox": [cx, cy, bw, bh], "poly": None})
+
+                    for cls, start, length in poly_splits:
+                        pts = keypoints[start:start+length]
+                        norm = [(x / new_w, y / new_h) for x, y in pts]
+                        if len(norm) >= 3:
+                            new_labels.append({"class": cls, "bbox": None, "poly": norm})
+                        else:
+                            bbox_norm = polygon_to_bbox_norm(pts, new_w, new_h)
+                            new_labels.append({"class": cls, "bbox": bbox_norm, "poly": None})
+
+                    save_yolo_label(out_lbl_dir / f"{img_file.stem}_{name}.txt", new_labels)
+                    split_stats["augmented"] += 1
+
+                completed_work += 1
+                if progress_callback:
+                    progress_callback(completed_work / total_work)
+            
+            stats["splits"][split] = split_stats
+            stats["original_images"] += split_stats["original"]
+            stats["augmented_images"] += split_stats["augmented"]
+
+        # Update YAML
+        input_yaml_candidates = ["dataset.yaml", "data.yaml"]
+        input_yaml_path = None
+        for yaml_name in input_yaml_candidates:
+            candidate = input_dir / yaml_name
+            if candidate.exists():
+                input_yaml_path = candidate
+                break
+        
+        output_yaml_path = output_dir / "data.yaml"
+        if input_yaml_path:
+            with open(input_yaml_path, "r") as f:
+                data_cfg = yaml.safe_load(f)
+            data_cfg["path"] = str(output_dir.resolve())
+            data_cfg["train"] = "train/images"
+            data_cfg["val"] = "valid/images"
+            data_cfg["test"] = "test/images"
+            with open(output_yaml_path, "w") as f:
+                yaml.safe_dump(data_cfg, f, sort_keys=False)
+            
+            # Also create classes.txt if names exist
+            if "names" in data_cfg:
+                classes_path = output_dir / "classes.txt"
+                with open(classes_path, "w") as cf:
+                    for name in data_cfg["names"]:
+                        cf.write(f"{name}\n")
+        
+        return True, stats
+        
+    except Exception as e:
+        return False, {"error": str(e)}
+
+def visualize_yolo_annotations(image_path, label_path, class_names=None):
+    """
+    Visualize YOLO polygon/bbox annotations on an image.
+    Returns the annotated image as numpy array for Streamlit display.
+    
+    Args:
+        image_path: path to image file
+        label_path: path to YOLO label file
+        class_names: list of class names (optional)
+    
+    Returns:
+        annotated_img: numpy array (BGR format)
+        stats: dict with annotation statistics
+    """
+    # Load image
+    img = cv2.imread(image_path)
+    if img is None:
+        return None, {"error": f"Image not found: {image_path}"}
+    
+    h, w, _ = img.shape
+    
+    if not os.path.exists(label_path):
+        return img, {"error": f"Label file not found: {label_path}", "objects": 0}
+    
+    with open(label_path, "r") as f:
+        annotations = f.readlines()
+    
+    stats = {
+        "total_objects": len(annotations),
+        "classes": {},
+        "error": None
+    }
+    
+    # Generate random colors for each class
+    colors = [
+        (0, 255, 0),    # Green
+        (255, 0, 0),    # Blue
+        (0, 0, 255),    # Red
+        (255, 255, 0),  # Cyan
+        (255, 0, 255),  # Magenta
+        (0, 255, 255),  # Yellow
+        (128, 0, 128),  # Purple
+        (255, 128, 0),  # Orange
+    ]
+    
+    for ann in annotations:
+        parts = ann.strip().split()
+        if len(parts) < 3:
+            continue
+        
+        cls_id = int(parts[0])
+        coords = list(map(float, parts[1:]))
+        
+        # Track class statistics
+        class_name = str(cls_id)
+        if class_names and cls_id < len(class_names):
+            class_name = class_names[cls_id]
+        stats["classes"][class_name] = stats["classes"].get(class_name, 0) + 1
+        
+        # Choose color
+        color = colors[cls_id % len(colors)]
+        
+        # Check if it's a polygon (more than 4 values) or bbox (4 values)
+        if len(coords) > 4:
+            # Polygon format
+            polygon = []
+            for i in range(0, len(coords), 2):
+                x = int(coords[i] * w)
+                y = int(coords[i + 1] * h)
+                polygon.append([x, y])
+            
+            polygon = np.array(polygon, np.int32).reshape((-1, 1, 2))
+            
+            # Draw filled polygon with transparency
+            overlay = img.copy()
+            cv2.fillPoly(overlay, [polygon], color)
+            cv2.addWeighted(overlay, 0.3, img, 0.7, 0, img)
+            
+            # Draw polygon outline
+            cv2.polylines(img, [polygon], isClosed=True, color=color, thickness=2)
+            
+            # Put class label near first point
+            label_pos = tuple(polygon[0][0])
+        else:
+            # Bounding box format (cx, cy, w, h)
+            cx, cy, bw, bh = coords
+            x1 = int((cx - bw / 2) * w)
+            y1 = int((cy - bh / 2) * h)
+            x2 = int((cx + bw / 2) * w)
+            y2 = int((cy + bh / 2) * h)
+            
+            # Draw rectangle
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            
+            label_pos = (x1, y1 - 10 if y1 > 20 else y1 + 20)
+        
+        # Put class label
+        cv2.putText(img, class_name, label_pos, cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, color, 2)
+    
+    return img, stats
+
 # Main App Layout
 st.title("🚀 YOLO Training & Conversion Dashboard")
 st.markdown("---")
 
 # Create tabs for different sections
-tab1, tab2, tab3 = st.tabs(["📦 COCO to YOLO Converter", "🔄 TFLite Conversion", "🎯 Model Training"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📦 COCO to YOLO Converter", "🎨 Dataset Augmentation", "🔍 Annotation Checker", "🔄 TFLite Conversion", "🎯 Model Training"])
 
 # ==================== TAB 1: COCO to YOLO Converter ====================
 with tab1:
@@ -580,8 +1002,471 @@ output_folder/
 
 st.markdown("---")
 
-# ==================== TAB 2: TFLite Conversion ====================
+# ==================== TAB 2: Dataset Augmentation ====================
 with tab2:
+    st.header("🎨 YOLO Dataset Augmentation")
+    st.markdown("Apply geometric and photometric augmentations to expand your YOLO dataset")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("📁 Dataset Selection")
+        
+        # Find all YOLO datasets
+        yolo_datasets = []
+        for root, dirs, files in os.walk(DATASET_DIR):
+            if 'data.yaml' in files or 'dataset.yaml' in files:
+                # Check if it has proper structure
+                has_structure = False
+                for split in ['train', 'valid', 'val', 'test']:
+                    if os.path.exists(os.path.join(root, split, 'images')):
+                        has_structure = True
+                        break
+                if has_structure:
+                    yolo_datasets.append(root)
+        
+        if yolo_datasets:
+            dataset_options = [os.path.relpath(d, DATASET_DIR) for d in yolo_datasets]
+            selected_aug_dataset = st.selectbox(
+                "Select Dataset to Augment:",
+                dataset_options,
+                key="aug_dataset"
+            )
+            
+            full_dataset_path = os.path.join(DATASET_DIR, selected_aug_dataset)
+            
+            # Load dataset info
+            yaml_files = ['data.yaml', 'dataset.yaml']
+            dataset_yaml = None
+            class_names = None
+            
+            for yaml_file in yaml_files:
+                yaml_path = os.path.join(full_dataset_path, yaml_file)
+                if os.path.exists(yaml_path):
+                    with open(yaml_path, 'r') as f:
+                        dataset_yaml = yaml.safe_load(f)
+                    break
+            
+            # Show dataset info
+            if dataset_yaml:
+                if 'names' in dataset_yaml:
+                    class_names = dataset_yaml['names']
+                    st.info(f"📊 Dataset: {len(class_names)} classes")
+                if 'nc' in dataset_yaml:
+                    st.info(f"📊 Classes: {dataset_yaml['nc']}")
+            
+            # Count current images
+            st.subheader("📈 Current Dataset Statistics")
+            current_stats = {}
+            total_images = 0
+            
+            for split in ['train', 'valid', 'val', 'test']:
+                split_dir = os.path.join(full_dataset_path, split, 'images')
+                if os.path.exists(split_dir):
+                    img_files = []
+                    for ext in ['*.jpg', '*.jpeg', '*.png']:
+                        img_files.extend(glob.glob(os.path.join(split_dir, ext)))
+                    current_stats[split] = len(img_files)
+                    total_images += len(img_files)
+            
+            if current_stats:
+                stat_cols = st.columns(len(current_stats))
+                for idx, (split, count) in enumerate(current_stats.items()):
+                    with stat_cols[idx]:
+                        st.metric(split.capitalize(), count)
+                st.metric("**Total Original Images**", total_images)
+            
+            # Output directory
+            st.subheader("💾 Output Configuration")
+            output_name = st.text_input(
+                "Augmented dataset folder name:",
+                value=f"{selected_aug_dataset.split('/')[-1]}_augmented",
+                help="Name for the augmented dataset folder",
+                key="aug_output_name"
+            )
+            
+            output_path = os.path.join(DATASET_DIR, output_name)
+            st.text(f"Output path: {output_path}")
+            
+            if os.path.exists(output_path):
+                st.warning("⚠️ Output folder already exists and will be overwritten!")
+        else:
+            st.warning("⚠️ No YOLO datasets found")
+            st.info("💡 Convert a COCO dataset first or ensure your dataset has the proper structure")
+    
+    with col2:
+        st.subheader("🎨 Augmentations Applied")
+        
+        st.markdown("### Geometric (40+ variants)")
+        st.markdown("""
+        - ✅ Horizontal/Vertical Flip
+        - ✅ Rotations (90°, 180°, 270°)
+        - ✅ Fine rotations (every 12°)
+        - ✅ Shear transforms (X/Y axis)
+        - ✅ Zoom out (90% to 30%)
+        """)
+        
+        st.markdown("### Photometric (11 variants)")
+        st.markdown("""
+        - ✅ Brightness & Contrast
+        - ✅ HSV Shifts
+        - ✅ RGB Shifts
+        - ✅ CLAHE (histogram equalization)
+        - ✅ Gamma correction
+        - ✅ Motion blur
+        - ✅ Gaussian noise
+        - ✅ Low light simulation 🌙
+        - ✅ Overexposed simulation ☀️
+        - ✅ Reflection reduction ✨
+        - ✅ Low resolution simulation 📱
+        """)
+        
+        st.markdown("---")
+        st.info("📊 **Total**: ~50+ augmented versions per image")
+    
+    st.markdown("---")
+    
+    # Augmentation button
+    if yolo_datasets:
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+        
+        with col_btn2:
+            if st.button("🚀 Start Augmentation", type="primary", use_container_width=True, key="aug_start_btn"):
+                if os.path.exists(output_path):
+                    st.warning(f"⚠️ This will delete and recreate: {output_path}")
+                
+                with st.spinner("🎨 Augmenting dataset... This may take several minutes."):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    def update_progress(val):
+                        progress_bar.progress(val)
+                    
+                    def update_status(text):
+                        status_text.text(text)
+                    
+                    update_status("🔄 Initializing augmentation pipeline...")
+                    
+                    success, stats = augment_dataset_streamlit(
+                        input_dir=full_dataset_path,
+                        output_dir=output_path,
+                        progress_callback=update_progress,
+                        status_callback=update_status
+                    )
+                    
+                    progress_bar.progress(100)
+                    status_text.empty()
+                    
+                    if success:
+                        st.success("✅ Augmentation completed successfully!")
+                        
+                        # Show statistics
+                        st.subheader("📊 Augmentation Results")
+                        
+                        result_cols = st.columns(3)
+                        with result_cols[0]:
+                            st.metric("Original Images", stats["original_images"])
+                        with result_cols[1]:
+                            st.metric("Augmented Images", stats["augmented_images"])
+                        with result_cols[2]:
+                            total = stats["original_images"] + stats["augmented_images"]
+                            st.metric("Total Images", total)
+                        
+                        # Per-split breakdown
+                        st.markdown("### 📂 Split Breakdown")
+                        if "splits" in stats:
+                            for split, split_stats in stats["splits"].items():
+                                with st.expander(f"📁 {split.upper()}", expanded=True):
+                                    cols = st.columns(3)
+                                    with cols[0]:
+                                        st.metric("Original", split_stats["original"])
+                                    with cols[1]:
+                                        st.metric("Augmented", split_stats["augmented"])
+                                    with cols[2]:
+                                        st.metric("Total", split_stats["original"] + split_stats["augmented"])
+                        
+                        # Show files created
+                        st.markdown("### 📁 Generated Files")
+                        st.code(f"""
+✅ {output_path}/data.yaml
+✅ {output_path}/classes.txt
+✅ {output_path}/train/ (images + labels)
+✅ {output_path}/valid/ (images + labels)
+✅ {output_path}/test/ (images + labels)
+                        """, language="text")
+                        
+                        st.info(f"💡 **data.yaml path**: `{os.path.join(output_path, 'data.yaml')}`")
+                        st.markdown("You can now use this augmented dataset for training in the **Model Training** tab!")
+                        
+                        # Multiplier info
+                        if stats["original_images"] > 0:
+                            multiplier = (stats["original_images"] + stats["augmented_images"]) / stats["original_images"]
+                            st.success(f"🎉 Dataset expanded by **{multiplier:.1f}x** (from {stats['original_images']} to {stats['original_images'] + stats['augmented_images']} images)")
+                    else:
+                        error_msg = stats.get("error", "Unknown error")
+                        st.error(f"❌ Augmentation failed: {error_msg}")
+                        st.info("💡 Check that your dataset has the proper YOLO structure with images and labels folders")
+    else:
+        st.info("📤 Please ensure you have a YOLO dataset in the dataset folder")
+        
+        st.markdown("### 📂 Expected Dataset Structure:")
+        st.code("""
+dataset/
+└── your_dataset/
+    ├── data.yaml (or dataset.yaml)
+    ├── train/
+    │   ├── images/
+    │   └── labels/
+    ├── valid/ (or val/)
+    │   ├── images/
+    │   └── labels/
+    └── test/
+        ├── images/
+        └── labels/
+        """, language="text")
+
+st.markdown("---")
+
+# ==================== TAB 3: Annotation Checker ====================
+with tab3:
+    st.header("🔍 YOLO Annotation Checker")
+    st.markdown("Visualize YOLO format annotations (polygons & bounding boxes) on your images")
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.subheader("📁 Dataset Selection")
+        
+        # Find all YOLO datasets with proper structure
+        yolo_datasets = []
+        for root, dirs, files in os.walk(DATASET_DIR):
+            if 'data.yaml' in files or 'dataset.yaml' in files:
+                yolo_datasets.append(root)
+        
+        if yolo_datasets:
+            dataset_options = [os.path.relpath(d, DATASET_DIR) for d in yolo_datasets]
+            selected_dataset_path = st.selectbox(
+                "Select YOLO Dataset:",
+                dataset_options,
+                key="anno_dataset"
+            )
+            
+            full_dataset_path = os.path.join(DATASET_DIR, selected_dataset_path)
+            
+            # Load dataset info
+            yaml_files = ['data.yaml', 'dataset.yaml']
+            dataset_yaml = None
+            class_names = None
+            
+            for yaml_file in yaml_files:
+                yaml_path = os.path.join(full_dataset_path, yaml_file)
+                if os.path.exists(yaml_path):
+                    with open(yaml_path, 'r') as f:
+                        dataset_yaml = yaml.safe_load(f)
+                    break
+            
+            # Get class names
+            if dataset_yaml and 'names' in dataset_yaml:
+                class_names = dataset_yaml['names']
+                st.success(f"✅ Loaded {len(class_names)} classes")
+            else:
+                # Try to load from classes.txt
+                classes_txt = os.path.join(full_dataset_path, 'classes.txt')
+                if os.path.exists(classes_txt):
+                    with open(classes_txt, 'r') as f:
+                        class_names = [line.strip() for line in f.readlines()]
+                    st.success(f"✅ Loaded {len(class_names)} classes from classes.txt")
+            
+            # Select split
+            st.subheader("📂 Split Selection")
+            available_splits = []
+            for split in ['train', 'valid', 'val', 'test']:
+                split_images = os.path.join(full_dataset_path, split, 'images')
+                if os.path.exists(split_images):
+                    available_splits.append(split)
+            
+            if available_splits:
+                selected_split = st.selectbox(
+                    "Select Split:",
+                    available_splits,
+                    key="anno_split"
+                )
+                
+                # Get all images in the selected split
+                images_dir = os.path.join(full_dataset_path, selected_split, 'images')
+                labels_dir = os.path.join(full_dataset_path, selected_split, 'labels')
+                
+                image_files = []
+                for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+                    image_files.extend(glob.glob(os.path.join(images_dir, ext)))
+                
+                if image_files:
+                    st.info(f"📸 Found {len(image_files)} images")
+                    
+                    # Select image
+                    st.subheader("🖼️ Image Selection")
+                    image_names = [os.path.basename(img) for img in image_files]
+                    
+                    # Add a search box
+                    search_term = st.text_input("🔎 Search images:", "", key="image_search")
+                    
+                    if search_term:
+                        filtered_images = [img for img in image_names if search_term.lower() in img.lower()]
+                    else:
+                        filtered_images = image_names
+                    
+                    if filtered_images:
+                        selected_image_name = st.selectbox(
+                            f"Select Image ({len(filtered_images)} images):",
+                            filtered_images,
+                            key="selected_image"
+                        )
+                        
+                        selected_image_path = os.path.join(images_dir, selected_image_name)
+                        
+                        # Automatically find corresponding label
+                        image_stem = Path(selected_image_name).stem
+                        label_path = os.path.join(labels_dir, f"{image_stem}.txt")
+                        
+                        # Display annotation button
+                        st.markdown("---")
+                        if st.button("👁️ View Annotations", type="primary", use_container_width=True):
+                            st.session_state.show_annotations = True
+                    else:
+                        st.warning("No images match your search")
+                else:
+                    st.warning(f"⚠️ No images found in {images_dir}")
+            else:
+                st.warning("⚠️ No valid splits found (train/valid/test)")
+        else:
+            st.warning("⚠️ No YOLO datasets found in dataset folder")
+            st.info("💡 Convert a COCO dataset first using the 'COCO to YOLO Converter' tab")
+    
+    with col2:
+        st.subheader("📊 Annotation Visualization")
+        
+        if 'show_annotations' in st.session_state and st.session_state.show_annotations:
+            if 'selected_image_path' in locals() and 'label_path' in locals():
+                with st.spinner("🎨 Rendering annotations..."):
+                    # Visualize annotations
+                    annotated_img, stats = visualize_yolo_annotations(
+                        selected_image_path,
+                        label_path,
+                        class_names
+                    )
+                    
+                    if annotated_img is not None:
+                        # Convert BGR to RGB for display
+                        annotated_img_rgb = cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB)
+                        
+                        # Display the annotated image
+                        st.image(annotated_img_rgb, use_container_width=True, caption=selected_image_name)
+                        
+                        # Display statistics
+                        if 'error' in stats and stats['error']:
+                            st.warning(stats['error'])
+                        else:
+                            st.success(f"✅ Found {stats['total_objects']} annotated objects")
+                            
+                            # Show class distribution
+                            if stats['classes']:
+                                st.markdown("### 📋 Class Distribution")
+                                
+                                # Create columns for class stats
+                                class_cols = st.columns(min(len(stats['classes']), 4))
+                                for idx, (cls_name, count) in enumerate(stats['classes'].items()):
+                                    with class_cols[idx % len(class_cols)]:
+                                        st.metric(cls_name, count)
+                                
+                                # Create a bar chart
+                                import plotly.express as px
+                                df_classes = pd.DataFrame(
+                                    list(stats['classes'].items()),
+                                    columns=['Class', 'Count']
+                                )
+                                fig = px.bar(df_classes, x='Class', y='Count', 
+                                            title='Object Distribution',
+                                            color='Count',
+                                            color_continuous_scale='Viridis')
+                                st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Image info
+                        st.markdown("---")
+                        st.markdown("### 📄 File Information")
+                        col_info1, col_info2 = st.columns(2)
+                        
+                        with col_info1:
+                            st.text(f"Image: {selected_image_name}")
+                            st.text(f"Label: {os.path.basename(label_path)}")
+                        
+                        with col_info2:
+                            # Get image size
+                            img_pil = Image.open(selected_image_path)
+                            st.text(f"Resolution: {img_pil.size[0]}x{img_pil.size[1]}")
+                            img_size_mb = os.path.getsize(selected_image_path) / (1024 * 1024)
+                            st.text(f"Size: {img_size_mb:.2f} MB")
+                        
+                        # Navigation buttons
+                        st.markdown("---")
+                        col_nav1, col_nav2, col_nav3 = st.columns(3)
+                        
+                        with col_nav1:
+                            if st.button("⬅️ Previous Image", use_container_width=True):
+                                if 'filtered_images' in locals():
+                                    current_idx = filtered_images.index(selected_image_name)
+                                    if current_idx > 0:
+                                        st.session_state.selected_image = filtered_images[current_idx - 1]
+                                        st.rerun()
+                        
+                        with col_nav2:
+                            if st.button("🔄 Reload", use_container_width=True):
+                                st.rerun()
+                        
+                        with col_nav3:
+                            if st.button("➡️ Next Image", use_container_width=True):
+                                if 'filtered_images' in locals():
+                                    current_idx = filtered_images.index(selected_image_name)
+                                    if current_idx < len(filtered_images) - 1:
+                                        st.session_state.selected_image = filtered_images[current_idx + 1]
+                                        st.rerun()
+                    else:
+                        st.error("❌ Failed to load image")
+        else:
+            # Show instructions
+            st.info("👈 Select a dataset, split, and image from the left panel, then click 'View Annotations'")
+            
+            st.markdown("### 🎯 Features:")
+            st.markdown("""
+            - ✅ Visualize polygon and bounding box annotations
+            - ✅ Automatic label file detection
+            - ✅ Color-coded classes
+            - ✅ Class distribution statistics
+            - ✅ Navigate between images
+            - ✅ Search functionality
+            - ✅ Support for train/valid/test splits
+            """)
+            
+            # Show example structure
+            st.markdown("### 📂 Expected Dataset Structure:")
+            st.code("""
+dataset/
+└── your_dataset/
+    ├── data.yaml (or classes.txt)
+    ├── train/
+    │   ├── images/
+    │   └── labels/
+    ├── valid/
+    │   ├── images/
+    │   └── labels/
+    └── test/
+        ├── images/
+        └── labels/
+            """, language="text")
+
+st.markdown("---")
+
+# ==================== TAB 4: TFLite Conversion ====================
+with tab4:
     st.header("📦 Convert Model to TFLite")
     st.markdown("Select any trained `.pt` model and convert it to TFLite format")
     
@@ -653,11 +1538,49 @@ with tab2:
 
 st.markdown("---")
 
-# ==================== TAB 3: Model Training ====================
-with tab3:
+# ==================== TAB 5: Model Training ====================
+with tab5:
 
     st.header("🎯 Train YOLO Model")
     st.markdown("Configure training parameters and train your model")
+    
+    # Prominent Epochs and Patience Configuration
+    st.markdown("### 🔢 Essential Training Parameters")
+    
+    col_e1, col_e2, col_e3 = st.columns([2, 2, 3])
+    
+    with col_e1:
+        epochs_main = st.number_input(
+            "🔄 Epochs",
+            min_value=1,
+            max_value=2000,
+            value=100,
+            step=10,
+            help="Number of complete passes through the training dataset",
+            key="epochs_main"
+        )
+        st.caption("💡 More epochs = longer training")
+    
+    with col_e2:
+        patience_main = st.number_input(
+            "⏱️ Patience",
+            min_value=0,
+            max_value=200,
+            value=50,
+            step=5,
+            help="Stop training if no improvement for N epochs",
+            key="patience_main"
+        )
+        st.caption("💡 Prevents overfitting")
+    
+    with col_e3:
+        st.markdown("#### 📊 Training Duration")
+        st.info(f"**Max Epochs**: {epochs_main}")
+        st.info(f"**Early Stop**: After {patience_main} epochs without improvement")
+        estimated_time = epochs_main * 0.5  # Rough estimate: 30 seconds per epoch
+        st.caption(f"⏰ Estimated: ~{estimated_time:.0f} minutes (may vary)")
+    
+    st.markdown("---")
 
 # Sidebar for configuration
 with st.sidebar:
@@ -704,8 +1627,10 @@ with st.sidebar:
     with st.expander("Basic Settings", expanded=True):
         imgsz = st.number_input("Image Size", min_value=320, max_value=1280, value=640, step=32)
         batch = st.number_input("Batch Size", min_value=1, max_value=64, value=24, step=1)
-        epochs = st.number_input("Epochs", min_value=1, max_value=2000, value=100, step=10)
-        patience = st.number_input("Patience (Early Stopping)", min_value=0, max_value=100, value=50, step=5)
+        
+        # Note about epochs and patience being in main tab
+        st.info("⬆️ **Epochs & Patience** are configured in the main Training tab above")
+        
         device = st.selectbox("Device", [0, "cpu"], index=0, help="0 for GPU, cpu for CPU")
     
     with st.expander("Advanced Settings"):
@@ -728,15 +1653,17 @@ with st.sidebar:
     # Convert to TFLite option
     convert_after_training = st.checkbox("Convert to TFLite after training", value=True)
 
-# Main content area
-col1, col2, col3 = st.columns([1, 1, 1])
+# Main content area - Model Selection Overview
+col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 
 with col1:
     st.metric("Selected Model", selected_model)
 with col2:
     st.metric("Dataset", selected_dataset.split('/')[-2] if '/' in selected_dataset else 'Dataset')
 with col3:
-    st.metric("Epochs", epochs)
+    st.metric("Epochs", epochs_main)
+with col4:
+    st.metric("Patience", patience_main)
 
 st.markdown("---")
 
@@ -756,8 +1683,8 @@ if st.session_state.training_started:
     params = {
         'imgsz': imgsz,
         'batch': batch,
-        'epochs': epochs,
-        'patience': patience,
+        'epochs': epochs_main,  # Use value from main tab
+        'patience': patience_main,  # Use value from main tab
         'workers': workers,
         'device': device,
         'optimizer': optimizer,
