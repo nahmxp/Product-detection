@@ -19,6 +19,7 @@ import numpy as np
 import cv2
 import albumentations as A
 import math
+from datetime import datetime
 
 # Page configuration
 st.set_page_config(
@@ -63,10 +64,231 @@ if 'results_df' not in st.session_state:
 MODEL_DIR = "./Model"
 DATASET_DIR = "./dataset"
 
+def get_model_class_names(model_path):
+    """Extract class names from a YOLO model file"""
+    try:
+        model = YOLO(model_path)
+        if hasattr(model, 'names'):
+            # Returns dict like {0: 'class1', 1: 'class2', ...}
+            return model.names
+        return None
+    except Exception as e:
+        return None
+
+def merge_class_names(old_classes, new_classes):
+    """
+    Merge class names from old model and new dataset.
+    Preserves old class indices and adds new classes.
+    
+    Args:
+        old_classes: dict or list from trained model
+        new_classes: list from new dataset YAML
+    
+    Returns:
+        merged_classes: list of all unique class names
+        class_mapping: dict mapping new dataset indices to merged indices
+    """
+    # Convert old_classes to list if it's a dict
+    if isinstance(old_classes, dict):
+        old_classes_list = [old_classes[i] for i in sorted(old_classes.keys())]
+    else:
+        old_classes_list = list(old_classes)
+    
+    # Start with old classes
+    merged_classes = old_classes_list.copy()
+    class_mapping = {}
+    
+    # Add new classes that don't exist in old classes
+    for idx, new_class in enumerate(new_classes):
+        if new_class in merged_classes:
+            # Class already exists, map to existing index
+            class_mapping[idx] = merged_classes.index(new_class)
+        else:
+            # New class, add to merged list
+            class_mapping[idx] = len(merged_classes)
+            merged_classes.append(new_class)
+    
+    return merged_classes, class_mapping
+
+def prepare_continual_learning_dataset(original_yaml_path, merged_classes, output_dir, class_mapping):
+    """
+    Prepare dataset for continual learning by updating labels with new class indices.
+    
+    Args:
+        original_yaml_path: Path to original dataset YAML
+        merged_classes: List of all merged class names
+        output_dir: Output directory for prepared dataset
+        class_mapping: Mapping from old indices to new indices
+    
+    Returns:
+        new_yaml_path: Path to new prepared dataset YAML
+    """
+    try:
+        # Load original YAML
+        with open(original_yaml_path, 'r') as f:
+            dataset_config = yaml.safe_load(f)
+        
+        # Get paths
+        original_dir = Path(original_yaml_path).parent
+        output_dir = Path(output_dir)
+        
+        # Create output directory structure
+        for split in ['train', 'valid', 'val', 'test']:
+            (output_dir / split / 'images').mkdir(parents=True, exist_ok=True)
+            (output_dir / split / 'labels').mkdir(parents=True, exist_ok=True)
+        
+        stats = {'processed': 0, 'copied': 0}
+        
+        # Process each split
+        for split in ['train', 'valid', 'val', 'test']:
+            split_img_dir = original_dir / split / 'images'
+            split_lbl_dir = original_dir / split / 'labels'
+            
+            if not split_img_dir.exists():
+                continue
+            
+            out_img_dir = output_dir / split / 'images'
+            out_lbl_dir = output_dir / split / 'labels'
+            
+            # Process each image and label
+            for img_file in split_img_dir.glob('*'):
+                if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                    # Copy image
+                    shutil.copy(str(img_file), str(out_img_dir / img_file.name))
+                    stats['copied'] += 1
+                    
+                    # Update label with new class indices
+                    label_file = split_lbl_dir / (img_file.stem + '.txt')
+                    new_label_file = out_lbl_dir / (img_file.stem + '.txt')
+                    
+                    if label_file.exists():
+                        with open(label_file, 'r') as f:
+                            lines = f.readlines()
+                        
+                        with open(new_label_file, 'w') as f:
+                            for line in lines:
+                                parts = line.strip().split()
+                                if len(parts) > 0:
+                                    old_class_id = int(parts[0])
+                                    # Map to new class ID
+                                    new_class_id = class_mapping.get(old_class_id, old_class_id)
+                                    # Write with new class ID
+                                    f.write(f"{new_class_id} {' '.join(parts[1:])}\n")
+                        
+                        stats['processed'] += 1
+        
+        # Create new YAML with merged classes
+        new_yaml_path = output_dir / 'data.yaml'
+        new_config = {
+            'path': str(output_dir.absolute()),
+            'train': 'train/images',
+            'val': 'valid/images' if (output_dir / 'valid' / 'images').exists() else 'val/images',
+            'test': 'test/images',
+            'nc': len(merged_classes),
+            'names': merged_classes
+        }
+        
+        with open(new_yaml_path, 'w') as f:
+            yaml.dump(new_config, f, default_flow_style=False, sort_keys=False)
+        
+        # Also create classes.txt
+        with open(output_dir / 'classes.txt', 'w') as f:
+            for class_name in merged_classes:
+                f.write(f"{class_name}\n")
+        
+        return True, str(new_yaml_path), stats
+        
+    except Exception as e:
+        return False, str(e), {}
+
+def train_continual_learning(model_path, data_yaml, params, freeze_layers=10):
+    """Train with continual learning (backbone freezing)"""
+    try:
+        model = YOLO(model_path)
+        
+        # Generate timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        train_name = f"continual_{timestamp}"
+        
+        # Train with frozen layers
+        results = model.train(
+            data=data_yaml,
+            imgsz=params['imgsz'],
+            batch=params['batch'],
+            epochs=params['epochs'],
+            patience=params['patience'],
+            workers=params['workers'],
+            device=params['device'],
+            optimizer=params['optimizer'],
+            lr0=params['lr0'],
+            lrf=params['lrf'],
+            weight_decay=params['weight_decay'],
+            dropout=params['dropout'],
+            mosaic=params['mosaic'],
+            mixup=params['mixup'],
+            hsv_h=params['hsv_h'],
+            hsv_s=params['hsv_s'],
+            hsv_v=params['hsv_v'],
+            freeze=freeze_layers,  # Freeze backbone layers
+            project='./runs/segment',
+            name=train_name,
+            exist_ok=True,
+            verbose=True
+        )
+        
+        # Save versioned models
+        best_model_path = os.path.join(results.save_dir, 'weights', 'best.pt')
+        last_model_path = os.path.join(results.save_dir, 'weights', 'last.pt')
+        
+        model_name = os.path.splitext(os.path.basename(model_path))[0]
+        versioned_best_name = f"{model_name}_continual_{timestamp}_best.pt"
+        versioned_last_name = f"{model_name}_continual_{timestamp}_last.pt"
+        
+        versioned_best_path = os.path.join(MODEL_DIR, versioned_best_name)
+        versioned_last_path = os.path.join(MODEL_DIR, versioned_last_name)
+        
+        if os.path.exists(best_model_path):
+            shutil.copy(best_model_path, versioned_best_path)
+        if os.path.exists(last_model_path):
+            shutil.copy(last_model_path, versioned_last_path)
+        
+        return True, best_model_path, results.save_dir, versioned_best_path, versioned_last_path
+        
+    except Exception as e:
+        return False, str(e), None, None, None
+
 def get_available_models():
-    """Get all .pt files from Model directory"""
-    models = glob.glob(os.path.join(MODEL_DIR, "*.pt"))
-    return [os.path.basename(m) for m in models]
+    """Get all .pt files from entire project directory recursively"""
+    project_root = os.getcwd()
+    
+    # Find all .pt files recursively, excluding venv and __pycache__
+    models = []
+    for root, dirs, files in os.walk(project_root):
+        # Skip virtual environment and cache directories
+        dirs[:] = [d for d in dirs if d not in ['venv', '__pycache__', '.git', 'node_modules']]
+        
+        for file in files:
+            if file.endswith('.pt'):
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, project_root)
+                
+                # Get file size and modification time
+                size_mb = os.path.getsize(full_path) / (1024 * 1024)
+                mod_time = os.path.getmtime(full_path)
+                
+                models.append({
+                    'name': file,
+                    'path': full_path,
+                    'rel_path': rel_path,
+                    'size_mb': size_mb,
+                    'modified': mod_time,
+                    'directory': os.path.basename(os.path.dirname(full_path))
+                })
+    
+    # Sort by modification time (newest first)
+    models.sort(key=lambda x: x['modified'], reverse=True)
+    
+    return models
 
 def get_available_datasets():
     """Get all .yaml files from dataset directory recursively"""
@@ -173,13 +395,17 @@ def plot_training_metrics(df):
     return fig
 
 def train_model(model_path, data_yaml, params):
-    """Train the YOLO model"""
+    """Train the YOLO model with timestamped versioning"""
     try:
         # Load model
         model = YOLO(model_path)
         
         # Update session state
         st.session_state.total_epochs = params['epochs']
+        
+        # Generate timestamp for this training run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        train_name = f"train_{timestamp}"
         
         # Train the model
         results = model.train(
@@ -201,21 +427,39 @@ def train_model(model_path, data_yaml, params):
             hsv_s=params['hsv_s'],
             hsv_v=params['hsv_v'],
             project='./runs/segment',
-            name='streamlit_train',
+            name=train_name,
             exist_ok=True,
             verbose=True
         )
         
         # Get the path to the best model
         best_model_path = os.path.join(results.save_dir, 'weights', 'best.pt')
+        last_model_path = os.path.join(results.save_dir, 'weights', 'last.pt')
+        
+        # Create a versioned copy in the Model directory for easy access
+        model_name = os.path.splitext(os.path.basename(model_path))[0]
+        versioned_best_name = f"{model_name}_trained_{timestamp}_best.pt"
+        versioned_last_name = f"{model_name}_trained_{timestamp}_last.pt"
+        
+        versioned_best_path = os.path.join(MODEL_DIR, versioned_best_name)
+        versioned_last_path = os.path.join(MODEL_DIR, versioned_last_name)
+        
+        # Copy trained models to Model directory with version names
+        if os.path.exists(best_model_path):
+            shutil.copy(best_model_path, versioned_best_path)
+        if os.path.exists(last_model_path):
+            shutil.copy(last_model_path, versioned_last_path)
+        
         st.session_state.best_model_path = best_model_path
+        st.session_state.versioned_best_path = versioned_best_path
+        st.session_state.versioned_last_path = versioned_last_path
         st.session_state.training_complete = True
         
-        return True, best_model_path, results.save_dir
+        return True, best_model_path, results.save_dir, versioned_best_path, versioned_last_path
         
     except Exception as e:
         st.error(f"Training error: {str(e)}")
-        return False, None, None
+        return False, None, None, None, None
 
 def get_trained_models():
     """Get all .pt files from runs/segment directory"""
@@ -720,6 +964,102 @@ def augment_dataset_streamlit(input_dir, output_dir, progress_callback=None, sta
     except Exception as e:
         return False, {"error": str(e)}
 
+def delete_image_and_label(image_path, label_path):
+    """
+    Delete an image and its corresponding label file from the dataset.
+    
+    Args:
+        image_path: path to image file
+        label_path: path to label file
+    
+    Returns:
+        success: bool
+        message: str
+    """
+    try:
+        deleted_files = []
+        
+        # Delete image
+        if os.path.exists(image_path):
+            os.remove(image_path)
+            deleted_files.append(os.path.basename(image_path))
+        
+        # Delete label
+        if os.path.exists(label_path):
+            os.remove(label_path)
+            deleted_files.append(os.path.basename(label_path))
+        
+        if deleted_files:
+            return True, f"Deleted: {', '.join(deleted_files)}"
+        else:
+            return False, "No files found to delete"
+            
+    except Exception as e:
+        return False, f"Error deleting files: {str(e)}"
+
+def run_inference(model_path, image_path, conf=0.25, iou=0.45, img_size=640, show_conf=True, show_labels=True, line_width=2):
+    """
+    Run YOLO inference on an image with customizable parameters.
+    
+    Args:
+        model_path: Path to YOLO model (.pt file)
+        image_path: Path to image file
+        conf: Confidence threshold (0.0-1.0)
+        iou: IoU threshold for NMS (0.0-1.0)
+        img_size: Image size for inference
+        show_conf: Show confidence scores
+        show_labels: Show class labels
+        line_width: Bounding box line width
+    
+    Returns:
+        result_img: Annotated image (BGR)
+        detections: List of detection info
+        inference_time: Time taken for inference (ms)
+    """
+    try:
+        import time
+        
+        # Load model
+        model = YOLO(model_path)
+        
+        # Run inference
+        start_time = time.time()
+        results = model.predict(
+            source=image_path,
+            conf=conf,
+            iou=iou,
+            imgsz=img_size,
+            verbose=False
+        )
+        inference_time = (time.time() - start_time) * 1000  # Convert to ms
+        
+        # Get the first result (single image)
+        result = results[0]
+        
+        # Get annotated image
+        result_img = result.plot(
+            conf=show_conf,
+            labels=show_labels,
+            line_width=line_width
+        )
+        
+        # Extract detection information
+        detections = []
+        if result.boxes is not None:
+            for box in result.boxes:
+                detection = {
+                    'class_id': int(box.cls[0]),
+                    'class_name': model.names[int(box.cls[0])],
+                    'confidence': float(box.conf[0]),
+                    'bbox': box.xyxy[0].tolist()  # [x1, y1, x2, y2]
+                }
+                detections.append(detection)
+        
+        return True, result_img, detections, inference_time
+        
+    except Exception as e:
+        return False, None, [], 0
+
 def visualize_yolo_annotations(image_path, label_path, class_names=None):
     """
     Visualize YOLO polygon/bbox annotations on an image.
@@ -827,7 +1167,7 @@ st.title("🚀 YOLO Training & Conversion Dashboard")
 st.markdown("---")
 
 # Create tabs for different sections
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📦 COCO to YOLO Converter", "🎨 Dataset Augmentation", "🔍 Annotation Checker", "🔄 TFLite Conversion", "🎯 Model Training"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📦 COCO to YOLO Converter", "🎨 Dataset Augmentation", "🔍 Annotation Checker", "🎷 Inference/Detection", "🔄 TFLite Conversion", "🎯 Model Training", "🔄 Continual Learning"])
 
 # ==================== TAB 1: COCO to YOLO Converter ====================
 with tab1:
@@ -1229,8 +1569,24 @@ st.markdown("---")
 
 # ==================== TAB 3: Annotation Checker ====================
 with tab3:
-    st.header("🔍 YOLO Annotation Checker")
-    st.markdown("Visualize YOLO format annotations (polygons & bounding boxes) on your images")
+    st.header("🔍 YOLO Annotation Checker & Dataset Cleanup")
+    st.markdown("Visualize YOLO format annotations (polygons & bounding boxes) and remove bad images")
+    
+    # Initialize session state for deletion tracking
+    if 'deleted_files_count' not in st.session_state:
+        st.session_state.deleted_files_count = 0
+    if 'delete_confirm' not in st.session_state:
+        st.session_state.delete_confirm = False
+    
+    # Show cleanup statistics
+    if st.session_state.deleted_files_count > 0:
+        st.info(f"🗑️ **Cleanup Progress:** {st.session_state.deleted_files_count} image(s) deleted in this session")
+        
+        if st.button("🔄 Reset Counter", key="reset_delete_counter"):
+            st.session_state.deleted_files_count = 0
+            st.rerun()
+    
+    st.markdown("---")
     
     col1, col2 = st.columns([1, 2])
     
@@ -1406,7 +1762,7 @@ with tab3:
                             img_size_mb = os.path.getsize(selected_image_path) / (1024 * 1024)
                             st.text(f"Size: {img_size_mb:.2f} MB")
                         
-                        # Navigation buttons
+                        # Navigation and Delete buttons
                         st.markdown("---")
                         col_nav1, col_nav2, col_nav3 = st.columns(3)
                         
@@ -1429,6 +1785,51 @@ with tab3:
                                     if current_idx < len(filtered_images) - 1:
                                         st.session_state.selected_image = filtered_images[current_idx + 1]
                                         st.rerun()
+                        
+                        # Delete functionality
+                        st.markdown("---")
+                        st.markdown("### 🗑️ Dataset Cleanup")
+                        st.warning("⚠️ Delete this image and label if annotations are incorrect")
+                        
+                        col_del1, col_del2, col_del3 = st.columns([1, 1, 1])
+                        
+                        with col_del1:
+                            if not st.session_state.delete_confirm:
+                                if st.button("🗑️ Delete Image & Label", type="secondary", use_container_width=True, key="delete_btn"):
+                                    st.session_state.delete_confirm = True
+                                    st.rerun()
+                        
+                        if st.session_state.delete_confirm:
+                            with col_del2:
+                                if st.button("✅ Confirm Delete", type="primary", use_container_width=True, key="confirm_delete"):
+                                    # Perform deletion
+                                    success, message = delete_image_and_label(selected_image_path, label_path)
+                                    
+                                    if success:
+                                        st.session_state.deleted_files_count += 1
+                                        st.success(f"✅ {message}")
+                                        
+                                        # Navigate to next image if available
+                                        if 'filtered_images' in locals():
+                                            current_idx = filtered_images.index(selected_image_name)
+                                            if current_idx < len(filtered_images) - 1:
+                                                st.session_state.selected_image = filtered_images[current_idx + 1]
+                                            elif current_idx > 0:
+                                                st.session_state.selected_image = filtered_images[current_idx - 1]
+                                        
+                                        st.session_state.delete_confirm = False
+                                        st.session_state.show_annotations = False
+                                        st.rerun()
+                                    else:
+                                        st.error(f"❌ {message}")
+                                        st.session_state.delete_confirm = False
+                            
+                            with col_del3:
+                                if st.button("❌ Cancel", use_container_width=True, key="cancel_delete"):
+                                    st.session_state.delete_confirm = False
+                                    st.rerun()
+                            
+                            st.error(f"⚠️ **Are you sure?** This will permanently delete:\n- {selected_image_name}\n- {os.path.basename(label_path)}")
                     else:
                         st.error("❌ Failed to load image")
         else:
@@ -1465,8 +1866,304 @@ dataset/
 
 st.markdown("---")
 
-# ==================== TAB 4: TFLite Conversion ====================
+# ==================== TAB 4: Inference/Detection ====================
 with tab4:
+    st.header("🎷 YOLO Inference & Detection")
+    st.markdown("Run object detection on images using trained YOLO models")
+    
+    # Initialize session state
+    if 'inference_result' not in st.session_state:
+        st.session_state.inference_result = None
+    if 'inference_image_path' not in st.session_state:
+        st.session_state.inference_image_path = None
+    
+    st.markdown("---")
+    
+    # Two columns layout
+    col_inf1, col_inf2 = st.columns([1, 2])
+    
+    with col_inf1:
+        st.subheader("⚙️ Configuration")
+        
+        # Model Selection
+        st.markdown("#### 1️⃣ Select Model")
+        all_models_inference = get_available_models()
+        
+        if all_models_inference:
+            model_inference_names = [f"{m['name']} ({m['directory']}) - {m['size_mb']:.1f}MB" for m in all_models_inference]
+            selected_inference_idx = st.selectbox(
+                "Choose model:",
+                range(len(model_inference_names)),
+                format_func=lambda i: model_inference_names[i],
+                key="inference_model_select"
+            )
+            
+            selected_inference_model = all_models_inference[selected_inference_idx]
+            inference_model_path = selected_inference_model['path']
+            
+            # Show model classes
+            model_classes = get_model_class_names(inference_model_path)
+            if model_classes:
+                num_classes = len(model_classes)
+                st.success(f"✅ Model has {num_classes} classes")
+                with st.expander("🏷️ View Classes"):
+                    if isinstance(model_classes, dict):
+                        classes_text = ', '.join([model_classes[i] for i in sorted(model_classes.keys())])
+                    else:
+                        classes_text = ', '.join(model_classes)
+                    st.caption(classes_text)
+        else:
+            st.error("No models found!")
+            st.stop()
+        
+        st.markdown("---")
+        
+        # Image Source Selection
+        st.markdown("#### 2️⃣ Select Image")
+        image_source = st.radio(
+            "Image source:",
+            ["Upload Image", "Select from Dataset"],
+            key="image_source"
+        )
+        
+        selected_image_path = None
+        
+        if image_source == "Upload Image":
+            uploaded_file = st.file_uploader(
+                "Upload an image:",
+                type=['jpg', 'jpeg', 'png'],
+                key="upload_inference_image"
+            )
+            
+            if uploaded_file is not None:
+                # Save uploaded file temporarily
+                temp_image_path = os.path.join(tempfile.gettempdir(), uploaded_file.name)
+                with open(temp_image_path, 'wb') as f:
+                    f.write(uploaded_file.read())
+                selected_image_path = temp_image_path
+                st.success(f"✅ Uploaded: {uploaded_file.name}")
+        else:
+            # Select from dataset
+            available_datasets_inf = get_available_datasets()
+            if available_datasets_inf:
+                selected_dataset_inf = st.selectbox(
+                    "Choose dataset:",
+                    available_datasets_inf,
+                    key="inference_dataset"
+                )
+                
+                dataset_dir = os.path.join(DATASET_DIR, os.path.dirname(selected_dataset_inf))
+                
+                # Find images
+                all_images = []
+                for split in ['train', 'valid', 'val', 'test']:
+                    img_dir = os.path.join(dataset_dir, split, 'images')
+                    if os.path.exists(img_dir):
+                        for ext in ['*.jpg', '*.jpeg', '*.png']:
+                            all_images.extend(glob.glob(os.path.join(img_dir, ext)))
+                
+                if all_images:
+                    image_names = [os.path.basename(img) for img in all_images]
+                    selected_img_name = st.selectbox(
+                        "Select image:",
+                        image_names,
+                        key="inference_dataset_image"
+                    )
+                    selected_image_path = [img for img in all_images if os.path.basename(img) == selected_img_name][0]
+                    st.success(f"✅ Selected: {selected_img_name}")
+                else:
+                    st.warning("No images found in dataset")
+        
+        st.markdown("---")
+        
+        # Inference Parameters
+        st.markdown("#### 3️⃣ Detection Parameters")
+        
+        conf_threshold = st.slider(
+            "Confidence Threshold:",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.25,
+            step=0.05,
+            help="Minimum confidence score for detections",
+            key="conf_threshold"
+        )
+        
+        iou_threshold = st.slider(
+            "IoU Threshold (NMS):",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.45,
+            step=0.05,
+            help="IoU threshold for Non-Maximum Suppression",
+            key="iou_threshold"
+        )
+        
+        img_size = st.selectbox(
+            "Image Size:",
+            [320, 480, 640, 800, 1024, 1280],
+            index=2,
+            help="Input image size for inference",
+            key="img_size_inference"
+        )
+        
+        with st.expander("🎨 Visualization Options"):
+            show_conf = st.checkbox("Show Confidence Scores", value=True, key="show_conf")
+            show_labels = st.checkbox("Show Class Labels", value=True, key="show_labels")
+            line_width = st.slider("Bounding Box Width:", 1, 5, 2, key="line_width")
+        
+        st.markdown("---")
+        
+        # Run Inference Button
+        if selected_image_path:
+            if st.button("🚀 Run Detection", type="primary", use_container_width=True, key="run_inference_btn"):
+                st.session_state.inference_image_path = selected_image_path
+                
+                with st.spinner("🔍 Running inference..."):
+                    success, result_img, detections, inf_time = run_inference(
+                        inference_model_path,
+                        selected_image_path,
+                        conf=conf_threshold,
+                        iou=iou_threshold,
+                        img_size=img_size,
+                        show_conf=show_conf,
+                        show_labels=show_labels,
+                        line_width=line_width
+                    )
+                    
+                    if success:
+                        st.session_state.inference_result = {
+                            'image': result_img,
+                            'detections': detections,
+                            'time': inf_time,
+                            'conf': conf_threshold,
+                            'iou': iou_threshold
+                        }
+                        st.rerun()
+                    else:
+                        st.error("❌ Inference failed!")
+        else:
+            st.info("📤 Please upload or select an image to run inference")
+    
+    with col_inf2:
+        st.subheader("📊 Detection Results")
+        
+        if st.session_state.inference_result is not None:
+            result = st.session_state.inference_result
+            
+            # Display annotated image
+            result_img_rgb = cv2.cvtColor(result['image'], cv2.COLOR_BGR2RGB)
+            st.image(result_img_rgb, use_container_width=True, caption="Detection Results")
+            
+            # Metrics
+            st.markdown("### 📈 Detection Metrics")
+            metric_cols = st.columns(4)
+            
+            with metric_cols[0]:
+                st.metric("Objects Detected", len(result['detections']))
+            with metric_cols[1]:
+                st.metric("Inference Time", f"{result['time']:.1f} ms")
+            with metric_cols[2]:
+                st.metric("Confidence", f"{result['conf']:.2f}")
+            with metric_cols[3]:
+                st.metric("IoU Threshold", f"{result['iou']:.2f}")
+            
+            # Detection Details
+            if result['detections']:
+                st.markdown("### 🎯 Detected Objects")
+                
+                # Create DataFrame
+                detection_data = []
+                for idx, det in enumerate(result['detections']):
+                    detection_data.append({
+                        '#': idx + 1,
+                        'Class': det['class_name'],
+                        'Confidence': f"{det['confidence']:.3f}",
+                        'BBox': f"({det['bbox'][0]:.0f}, {det['bbox'][1]:.0f}, {det['bbox'][2]:.0f}, {det['bbox'][3]:.0f})"
+                    })
+                
+                df_detections = pd.DataFrame(detection_data)
+                st.dataframe(df_detections, use_container_width=True, hide_index=True)
+                
+                # Class distribution
+                st.markdown("### 📊 Class Distribution")
+                class_counts = {}
+                for det in result['detections']:
+                    class_name = det['class_name']
+                    class_counts[class_name] = class_counts.get(class_name, 0) + 1
+                
+                # Create bar chart
+                import plotly.express as px
+                df_classes = pd.DataFrame(
+                    list(class_counts.items()),
+                    columns=['Class', 'Count']
+                )
+                fig = px.bar(df_classes, x='Class', y='Count',
+                            title='Detected Objects by Class',
+                            color='Count',
+                            color_continuous_scale='Viridis')
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Download option
+                st.markdown("---")
+                st.markdown("### 💾 Download Results")
+                
+                col_dl1, col_dl2 = st.columns(2)
+                
+                with col_dl1:
+                    # Save annotated image
+                    if st.button("📥 Download Annotated Image", use_container_width=True):
+                        output_path = "detection_result.jpg"
+                        cv2.imwrite(output_path, result['image'])
+                        st.success(f"✅ Saved as: {output_path}")
+                
+                with col_dl2:
+                    # Download detection data as JSON
+                    if st.button("📥 Download Detection Data (JSON)", use_container_width=True):
+                        import json
+                        output_json = {
+                            'inference_time_ms': result['time'],
+                            'confidence_threshold': result['conf'],
+                            'iou_threshold': result['iou'],
+                            'detections': result['detections']
+                        }
+                        with open("detection_results.json", "w") as f:
+                            json.dump(output_json, f, indent=2)
+                        st.success("✅ Saved as: detection_results.json")
+            else:
+                st.info("🔍 No objects detected with current confidence threshold")
+                st.caption(f"Try lowering the confidence threshold (current: {result['conf']:.2f})")
+        else:
+            # Show instructions
+            st.info("👈 Configure settings and click 'Run Detection' to see results")
+            
+            st.markdown("### 🎯 Features:")
+            st.markdown("""
+            - ✅ Upload images or select from datasets
+            - ✅ Adjustable confidence threshold
+            - ✅ Customizable IoU for NMS
+            - ✅ Multiple image size options
+            - ✅ Show/hide labels and confidence
+            - ✅ Detailed detection information
+            - ✅ Class distribution visualization
+            - ✅ Download annotated results
+            - ✅ Export detection data as JSON
+            """)
+            
+            st.markdown("### 📝 How to Use:")
+            st.markdown("""
+            1. **Select a trained model** from your project
+            2. **Upload an image** or select from dataset
+            3. **Adjust parameters** (confidence, IoU, size)
+            4. **Click 'Run Detection'** to see results
+            5. **Review detections** with bounding boxes
+            6. **Download results** if needed
+            """)
+
+st.markdown("---")
+
+# ==================== TAB 5: TFLite Conversion ====================
+with tab5:
     st.header("📦 Convert Model to TFLite")
     st.markdown("Select any trained `.pt` model and convert it to TFLite format")
     
@@ -1538,8 +2235,8 @@ with tab4:
 
 st.markdown("---")
 
-# ==================== TAB 5: Model Training ====================
-with tab5:
+# ==================== TAB 6: Model Training ====================
+with tab6:
 
     st.header("🎯 Train YOLO Model")
     st.markdown("Configure training parameters and train your model")
@@ -1590,14 +2287,64 @@ with st.sidebar:
     st.subheader("1️⃣ Select Model")
     available_models = get_available_models()
     if not available_models:
-        st.error("No models found in Model directory!")
+        st.error("No .pt model files found in project!")
         st.stop()
     
-    selected_model = st.selectbox(
+    # Create display names for models
+    model_display_names = []
+    for model in available_models:
+        # Format: "model_name (folder) - size MB"
+        display = f"{model['name']} ({model['directory']}) - {model['size_mb']:.1f}MB"
+        model_display_names.append(display)
+    
+    selected_model_idx = st.selectbox(
         "Choose a pretrained model:",
-        available_models,
-        help="Select a YOLO model from the Model folder"
+        range(len(model_display_names)),
+        format_func=lambda i: model_display_names[i],
+        help="Select any YOLO .pt model from the project"
     )
+    
+    selected_model_info = available_models[selected_model_idx]
+    selected_model = selected_model_info['name']
+    selected_model_path = selected_model_info['path']
+    
+    # Show model details
+    with st.expander("📄 Model Details", expanded=False):
+        st.text(f"Name: {selected_model}")
+        st.text(f"Path: {selected_model_info['rel_path']}")
+        st.text(f"Size: {selected_model_info['size_mb']:.2f} MB")
+        
+        # Show last modified time
+        mod_time = datetime.fromtimestamp(selected_model_info['modified'])
+        st.text(f"Modified: {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        st.markdown("---")
+        
+        # Extract and display trained class names
+        st.markdown("**🏷️ Trained Classes:**")
+        with st.spinner("Loading model metadata..."):
+            class_names = get_model_class_names(selected_model_path)
+            
+            if class_names:
+                # class_names is a dict like {0: 'person', 1: 'car', ...}
+                if isinstance(class_names, dict):
+                    num_classes = len(class_names)
+                    st.success(f"✅ {num_classes} classes detected")
+                    
+                    # Display classes in a nice format
+                    classes_list = [f"{idx}: {name}" for idx, name in class_names.items()]
+                    
+                    # Show first 10, with option to see all
+                    if len(classes_list) <= 10:
+                        st.code('\n'.join(classes_list), language='text')
+                    else:
+                        st.code('\n'.join(classes_list[:10]), language='text')
+                        if st.checkbox(f"Show all {num_classes} classes", key="show_all_classes"):
+                            st.code('\n'.join(classes_list), language='text')
+                else:
+                    st.info("Model loaded but class names format not recognized")
+            else:
+                st.warning("⚠️ Could not load class names (may be a pretrained base model)")
     
     # Dataset Selection
     st.subheader("2️⃣ Select Dataset")
@@ -1699,7 +2446,8 @@ if st.session_state.training_started:
         'hsv_v': hsv_v
     }
     
-    model_path = os.path.join(MODEL_DIR, selected_model)
+    # Use the full path from model selection
+    model_path = selected_model_path
     data_yaml = os.path.join(DATASET_DIR, selected_dataset)
     
     if not st.session_state.training_complete:
@@ -1710,11 +2458,16 @@ if st.session_state.training_started:
             status_placeholder.info("⏳ Initializing training...")
             
             # Train the model
-            success, best_model_path, save_dir = train_model(model_path, data_yaml, params)
+            success, best_model_path, save_dir, versioned_best, versioned_last = train_model(model_path, data_yaml, params)
             
             if success:
                 st.success(f"✅ Training completed successfully!")
                 st.session_state.training_complete = True
+                st.session_state.latest_train_dir = save_dir  # Store the training directory
+                
+                # Show versioned model info
+                st.info(f"📦 **Versioned Models Created:**")
+                st.code(f"Best: {versioned_best}\nLast: {versioned_last}", language="text")
                 
                 # Read results
                 results_csv = os.path.join(save_dir, 'results.csv')
@@ -1730,8 +2483,8 @@ if st.session_state.training_started:
 if st.session_state.training_complete:
     st.header("📊 Training Results")
     
-    # Get the latest training directory
-    latest_train_dir = os.path.join('./runs/segment/streamlit_train')
+    # Get the latest training directory from session state
+    latest_train_dir = st.session_state.get('latest_train_dir', './runs/segment/streamlit_train')
     
     if os.path.exists(latest_train_dir):
         # Display metrics
@@ -1827,6 +2580,130 @@ if st.session_state.training_complete:
         st.success("✅ TFLite conversion completed!")
         st.info("💡 You can also convert other models using the 'TFLite Conversion' tab.")
     
+    # Model Inspector Tool
+    st.markdown("---")
+    st.subheader("🔍 Model Inspector")
+    st.markdown("Inspect any model to see its trained classes")
+    
+    col_insp1, col_insp2 = st.columns([1, 1])
+    
+    with col_insp1:
+        # Get all models for inspection
+        all_models_inspect = get_available_models()
+        
+        if all_models_inspect:
+            model_inspect_names = [f"{m['name']} ({m['directory']})" for m in all_models_inspect]
+            selected_inspect_idx = st.selectbox(
+                "Select model to inspect:",
+                range(len(model_inspect_names)),
+                format_func=lambda i: model_inspect_names[i],
+                key="model_inspector"
+            )
+            
+            inspect_model = all_models_inspect[selected_inspect_idx]
+            
+            if st.button("🔍 Inspect Model", type="primary", key="inspect_btn"):
+                st.session_state.inspect_result = {
+                    'path': inspect_model['path'],
+                    'name': inspect_model['name']
+                }
+    
+    with col_insp2:
+        if 'inspect_result' in st.session_state:
+            result = st.session_state.inspect_result
+            
+            st.markdown(f"**Inspecting:** `{result['name']}`")
+            
+            with st.spinner("Loading model..."):
+                class_names = get_model_class_names(result['path'])
+                
+                if class_names:
+                    if isinstance(class_names, dict):
+                        num_classes = len(class_names)
+                        st.success(f"✅ **{num_classes} classes found**")
+                        
+                        # Create a nice display
+                        classes_display = ', '.join([name for idx, name in sorted(class_names.items())])
+                        st.info(f"**Classes:** {classes_display}")
+                        
+                        # Also show as a list
+                        with st.expander("📋 View as list"):
+                            for idx, name in sorted(class_names.items()):
+                                st.text(f"{idx}: {name}")
+                else:
+                    st.warning("⚠️ Could not load class names from this model")
+    
+    # Show all trained model versions
+    st.markdown("---")
+    st.subheader("📦 All Trained Model Versions")
+    
+    # Get all trained models with timestamps
+    trained_versions = []
+    for file in os.listdir(MODEL_DIR):
+        if file.endswith('_trained_') and file.endswith('.pt'):
+            full_path = os.path.join(MODEL_DIR, file)
+            size_mb = os.path.getsize(full_path) / (1024 * 1024)
+            mod_time = os.path.getmtime(full_path)
+            trained_versions.append({
+                'name': file,
+                'path': full_path,
+                'size_mb': size_mb,
+                'modified': mod_time
+            })
+    
+    # Sort by modification time (newest first)
+    trained_versions.sort(key=lambda x: x['modified'], reverse=True)
+    
+    if trained_versions:
+        st.info(f"Found {len(trained_versions)} trained model versions")
+        
+        # Create a dataframe for display with class information
+        model_data = []
+        for v in trained_versions:
+            # Try to get class count
+            class_names = get_model_class_names(v['path'])
+            num_classes = len(class_names) if class_names and isinstance(class_names, dict) else 'N/A'
+            
+            model_data.append({
+                'Model': v['name'],
+                'Size (MB)': f"{v['size_mb']:.2f}",
+                'Classes': num_classes,
+                'Created': datetime.fromtimestamp(v['modified']).strftime('%Y-%m-%d %H:%M:%S'),
+                'Type': 'Best' if '_best.pt' in v['name'] else 'Last'
+            })
+        
+        df_models = pd.DataFrame(model_data)
+        st.dataframe(df_models, use_container_width=True, hide_index=True)
+        
+        st.caption("💡 Use the Model Inspector above to see detailed class names for any model")
+        
+        # Option to delete old versions
+        with st.expander("🗑️ Manage Model Versions"):
+            st.warning("⚠️ Delete old model versions to free up space")
+            
+            if len(trained_versions) > 0:
+                delete_options = [f"{v['name']} ({v['size_mb']:.1f}MB)" for v in trained_versions]
+                models_to_delete = st.multiselect(
+                    "Select models to delete:",
+                    delete_options,
+                    key="models_to_delete"
+                )
+                
+                if models_to_delete and st.button("🗑️ Delete Selected Models", type="secondary"):
+                    deleted_count = 0
+                    for model_display in models_to_delete:
+                        # Extract model name from display
+                        model_name = model_display.split(' (')[0]
+                        model_path = os.path.join(MODEL_DIR, model_name)
+                        if os.path.exists(model_path):
+                            os.remove(model_path)
+                            deleted_count += 1
+                    
+                    st.success(f"✅ Deleted {deleted_count} model(s)")
+                    st.rerun()
+    else:
+        st.info("No trained model versions found yet. Train a model to create versioned copies!")
+    
     # Reset button
     st.markdown("---")
     if st.button("🔄 Start New Training", type="secondary"):
@@ -1836,6 +2713,350 @@ if st.session_state.training_complete:
         st.session_state.best_model_path = None
         st.session_state.results_df = None
         st.rerun()
+
+# ==================== TAB 7: Continual Learning ====================
+with tab7:
+    st.header("🔄 Continual Learning")
+    st.markdown("""
+    **Continual Learning** allows you to train on new data while preserving knowledge from previously trained models.
+    This prevents **catastrophic forgetting** by freezing the backbone layers and only training the detection head.
+    """)
+    
+    # Initialize session state for continual learning
+    if 'continual_prepared' not in st.session_state:
+        st.session_state.continual_prepared = False
+    if 'continual_yaml_path' not in st.session_state:
+        st.session_state.continual_yaml_path = None
+    if 'continual_training_started' not in st.session_state:
+        st.session_state.continual_training_started = False
+    if 'continual_training_complete' not in st.session_state:
+        st.session_state.continual_training_complete = False
+    
+    st.markdown("---")
+    
+    # Step 1: Select Trained Model
+    st.subheader("📦 Step 1: Select Previously Trained Model")
+    st.info("💡 Select a model that has knowledge you want to preserve")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        all_models_continual = get_available_models()
+        
+        if all_models_continual:
+            model_continual_names = [f"{m['name']} ({m['directory']}) - {m['size_mb']:.1f}MB" for m in all_models_continual]
+            selected_continual_idx = st.selectbox(
+                "Select trained model:",
+                range(len(model_continual_names)),
+                format_func=lambda i: model_continual_names[i],
+                key="continual_model"
+            )
+            
+            selected_continual_model = all_models_continual[selected_continual_idx]
+            continual_model_path = selected_continual_model['path']
+            
+            # Get classes from selected model
+            old_classes = get_model_class_names(continual_model_path)
+            
+            if old_classes:
+                if isinstance(old_classes, dict):
+                    old_classes_list = [old_classes[i] for i in sorted(old_classes.keys())]
+                else:
+                    old_classes_list = list(old_classes)
+                
+                st.success(f"✅ Model has {len(old_classes_list)} trained classes")
+                with st.expander("🏷️ View Existing Classes"):
+                    st.code(', '.join(old_classes_list), language='text')
+            else:
+                st.warning("⚠️ Could not load classes from model")
+        else:
+            st.error("No models found!")
+            st.stop()
+    
+    with col2:
+        st.markdown("### 📊 Model Info")
+        if old_classes:
+            st.metric("Existing Classes", len(old_classes_list))
+            st.caption("These classes will be preserved")
+    
+    st.markdown("---")
+    
+    # Step 2: Select New Dataset
+    st.subheader("📂 Step 2: Select New Dataset")
+    st.info("💡 Select dataset with new classes you want to add")
+    
+    available_datasets_continual = get_available_datasets()
+    
+    if available_datasets_continual:
+        col3, col4 = st.columns([2, 1])
+        
+        with col3:
+            selected_dataset_continual = st.selectbox(
+                "Choose new dataset:",
+                available_datasets_continual,
+                key="continual_dataset"
+            )
+            
+            # Load new dataset info
+            new_dataset_info = load_dataset_info(selected_dataset_continual)
+            
+            if new_dataset_info and 'names' in new_dataset_info:
+                new_classes = new_dataset_info['names']
+                st.success(f"✅ Dataset has {len(new_classes)} classes")
+                
+                with st.expander("🏷️ View New Dataset Classes"):
+                    st.code(', '.join(new_classes), language='text')
+                
+                # Merge classes
+                if old_classes:
+                    merged_classes, class_mapping = merge_class_names(old_classes, new_classes)
+                    
+                    # Show merged result
+                    with col4:
+                        st.markdown("### 🔀 Merged Classes")
+                        st.metric("Total Classes", len(merged_classes))
+                        st.metric("Old Classes", len(old_classes_list))
+                        st.metric("New Classes", len(new_classes))
+                        
+                        new_unique = len([c for c in new_classes if c not in old_classes_list])
+                        st.metric("New Unique", new_unique)
+                    
+                    with st.expander("🔍 View Merged Class List"):
+                        st.markdown("**All Classes (Old + New):**")
+                        st.code(', '.join(merged_classes), language='text')
+                        
+                        st.markdown("**Class Mapping:**")
+                        mapping_text = '\n'.join([f"Dataset class {old_idx} ({new_classes[old_idx]}) → Merged class {new_idx}" 
+                                                 for old_idx, new_idx in class_mapping.items()])
+                        st.code(mapping_text, language='text')
+            else:
+                st.error("Could not load dataset classes")
+    else:
+        st.error("No datasets found!")
+    
+    st.markdown("---")
+    
+    # Step 3: Prepare Dataset
+    st.subheader("⚙️ Step 3: Prepare Dataset for Continual Learning")
+    
+    col5, col6 = st.columns([2, 1])
+    
+    with col5:
+        output_continual_name = st.text_input(
+            "Output dataset name:",
+            value=f"continual_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            key="continual_output_name"
+        )
+        
+        output_continual_path = os.path.join(DATASET_DIR, output_continual_name)
+        st.text(f"Will be saved to: {output_continual_path}")
+    
+    with col6:
+        freeze_layers = st.number_input(
+            "🔒 Freeze Layers",
+            min_value=0,
+            max_value=24,
+            value=10,
+            help="Number of backbone layers to freeze (10 recommended for YOLO)",
+            key="freeze_layers"
+        )
+        st.caption("💡 Freezing prevents forgetting old classes")
+    
+    if not st.session_state.continual_prepared:
+        if st.button("🚀 Prepare Dataset", type="primary", key="prepare_continual_btn"):
+            if old_classes and new_dataset_info and 'names' in new_dataset_info:
+                with st.spinner("📦 Preparing dataset with merged classes..."):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    status_text.text("Merging class names...")
+                    progress_bar.progress(20)
+                    
+                    merged_classes, class_mapping = merge_class_names(old_classes, new_dataset_info['names'])
+                    
+                    status_text.text("Creating dataset structure...")
+                    progress_bar.progress(40)
+                    
+                    original_yaml = os.path.join(DATASET_DIR, selected_dataset_continual)
+                    success, result, stats = prepare_continual_learning_dataset(
+                        original_yaml,
+                        merged_classes,
+                        output_continual_path,
+                        class_mapping
+                    )
+                    
+                    progress_bar.progress(100)
+                    status_text.empty()
+                    
+                    if success:
+                        st.success("✅ Dataset prepared successfully!")
+                        st.session_state.continual_prepared = True
+                        st.session_state.continual_yaml_path = result
+                        st.session_state.merged_classes = merged_classes
+                        
+                        # Show stats
+                        st.subheader("📊 Preparation Statistics")
+                        stat_cols = st.columns(3)
+                        with stat_cols[0]:
+                            st.metric("Images Copied", stats.get('copied', 0))
+                        with stat_cols[1]:
+                            st.metric("Labels Updated", stats.get('processed', 0))
+                        with stat_cols[2]:
+                            st.metric("Total Classes", len(merged_classes))
+                        
+                        st.info(f"📁 **Prepared Dataset YAML:** `{result}`")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Preparation failed: {result}")
+    else:
+        st.success("✅ Dataset already prepared!")
+        st.info(f"📁 **Prepared YAML:** `{st.session_state.continual_yaml_path}`")
+        st.info(f"🏷️ **Total Classes:** {len(st.session_state.merged_classes)}")
+        
+        if st.button("🔄 Prepare New Dataset", key="prepare_new_continual"):
+            st.session_state.continual_prepared = False
+            st.session_state.continual_yaml_path = None
+            st.session_state.continual_training_started = False
+            st.session_state.continual_training_complete = False
+            st.rerun()
+    
+    # Step 4: Start Continual Training
+    if st.session_state.continual_prepared and not st.session_state.continual_training_started:
+        st.markdown("---")
+        st.subheader("🎯 Step 4: Start Continual Learning Training")
+        
+        st.warning(f"""
+        **⚠️ Training Configuration:**
+        - **Backbone Freezing:** First {freeze_layers} layers will be frozen
+        - **Training Strategy:** Only detection head will be updated
+        - **Benefit:** Preserves old knowledge while learning new classes
+        """)
+        
+        # Training parameters (simplified)
+        train_col1, train_col2, train_col3 = st.columns(3)
+        
+        with train_col1:
+            cl_epochs = st.number_input("Epochs", min_value=10, max_value=500, value=50, step=10, key="cl_epochs_input")
+        with train_col2:
+            cl_batch = st.number_input("Batch Size", min_value=1, max_value=64, value=16, step=1, key="cl_batch_input")
+        with train_col3:
+            cl_patience = st.number_input("Patience", min_value=5, max_value=100, value=20, step=5, key="cl_patience_input")
+        
+        if st.button("🚀 Start Continual Learning", type="primary", use_container_width=True, key="start_cl_train"):
+            # Store parameters in session state (use different keys)
+            st.session_state.cl_epochs_value = cl_epochs
+            st.session_state.cl_batch_value = cl_batch
+            st.session_state.cl_patience_value = cl_patience
+            st.session_state.cl_freeze_layers_value = freeze_layers
+            st.session_state.continual_training_started = True
+            st.rerun()
+    
+    # Training in progress
+    if st.session_state.continual_training_started and not st.session_state.continual_training_complete:
+        st.markdown("---")
+        st.header("🔥 Training in Progress...")
+        
+        # Get parameters from session state
+        params_cl = {
+            'imgsz': 640,
+            'batch': st.session_state.get('cl_batch_value', 16),
+            'epochs': st.session_state.get('cl_epochs_value', 50),
+            'patience': st.session_state.get('cl_patience_value', 20),
+            'workers': 0,
+            'device': 0,
+            'optimizer': 'AdamW',
+            'lr0': 0.001,
+            'lrf': 0.01,
+            'weight_decay': 0.0005,
+            'dropout': 0.2,
+            'mosaic': 1.0,
+            'mixup': 0.15,
+            'hsv_h': 0.015,
+            'hsv_s': 0.7,
+            'hsv_v': 0.4
+        }
+        
+        with st.spinner("🔥 Training with backbone freezing..."):
+            status_text = st.empty()
+            progress_bar = st.progress(0)
+            
+            status_text.info("⏳ Initializing continual learning training...")
+            progress_bar.progress(10)
+            
+            success, best_path, save_dir, vers_best, vers_last = train_continual_learning(
+                continual_model_path,
+                st.session_state.continual_yaml_path,
+                params_cl,
+                freeze_layers=st.session_state.get('cl_freeze_layers_value', 10)
+            )
+            
+            progress_bar.progress(100)
+            
+            if success:
+                st.success("✅ Continual learning training completed!")
+                st.session_state.continual_training_complete = True
+                st.session_state.continual_best_path = vers_best
+                st.session_state.continual_last_path = vers_last
+                st.session_state.continual_save_dir = save_dir
+                
+                st.info(f"""
+                **📦 Trained Models:**
+                - Best: `{vers_best}`
+                - Last: `{vers_last}`
+                """)
+                
+                st.rerun()
+            else:
+                st.error(f"❌ Training failed: {best_path}")
+                st.session_state.continual_training_started = False
+    
+    # Training complete - show results
+    if st.session_state.continual_training_complete:
+        st.markdown("---")
+        st.header("✅ Continual Learning Complete!")
+        
+        st.success(f"""
+        **🎉 Your model now knows both old and new classes!**
+        
+        **Trained Models:**
+        - Best: `{st.session_state.continual_best_path}`
+        - Last: `{st.session_state.continual_last_path}`
+        
+        **Total Classes:** {len(st.session_state.merged_classes)}
+        """)
+        
+        with st.expander("🏷️ View All Learned Classes"):
+            st.code(', '.join(st.session_state.merged_classes), language='text')
+        
+        # Show training results if available
+        if 'continual_save_dir' in st.session_state and os.path.exists(st.session_state.continual_save_dir):
+            results_csv = os.path.join(st.session_state.continual_save_dir, 'results.csv')
+            if os.path.exists(results_csv):
+                df_results = read_training_results(results_csv)
+                if df_results is not None:
+                    st.subheader("📊 Training Metrics")
+                    
+                    metric_cols = st.columns(4)
+                    with metric_cols[0]:
+                        if 'metrics/mAP50(B)' in df_results.columns:
+                            st.metric("mAP50", f"{df_results['metrics/mAP50(B)'].iloc[-1]:.4f}")
+                    with metric_cols[1]:
+                        if 'metrics/mAP50-95(B)' in df_results.columns:
+                            st.metric("mAP50-95", f"{df_results['metrics/mAP50-95(B)'].iloc[-1]:.4f}")
+                    with metric_cols[2]:
+                        if 'metrics/precision(B)' in df_results.columns:
+                            st.metric("Precision", f"{df_results['metrics/precision(B)'].iloc[-1]:.4f}")
+                    with metric_cols[3]:
+                        if 'metrics/recall(B)' in df_results.columns:
+                            st.metric("Recall", f"{df_results['metrics/recall(B)'].iloc[-1]:.4f}")
+        
+        st.markdown("---")
+        if st.button("🔄 Start New Continual Learning", key="reset_continual"):
+            st.session_state.continual_prepared = False
+            st.session_state.continual_yaml_path = None
+            st.session_state.continual_training_started = False
+            st.session_state.continual_training_complete = False
+            st.rerun()
 
 # Footer
 st.markdown("---")
